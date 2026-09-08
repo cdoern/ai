@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Anthropic SSE event transformation filter.
+//! Anthropic Messages streaming SSE transformation filter.
 //!
-//! Transforms `OpenAI` Chat Completions SSE events into Anthropic
-//! Messages SSE events per-chunk while buffering partial events.
+//! Transforms Chat Completions SSE events into Anthropic Messages SSE
+//! events per-chunk while buffering partial events. Any Chat
+//! Completions-compatible backend is a valid source, not only OpenAI.
 
 mod config;
 
@@ -18,7 +19,7 @@ use praxis_filter::{
 use serde_json::Value;
 use tracing::debug;
 
-use self::config::{AnthropicStreamEventsConfig, build_config};
+use self::config::{AnthropicMessagesToChatCompletionsStreamConfig, build_config};
 use crate::{
     anthropic::wire::{ContentBlock, MessageDeltaUsage, MessageUsage},
     is_event_stream_content_type,
@@ -66,6 +67,12 @@ const FINISH_REASON_KEY: &str = "anthropic_stream.finish_reason";
 /// Metadata key for accumulated output token count.
 const OUTPUT_TOKENS_KEY: &str = "anthropic_stream.output_tokens";
 
+/// Metadata key for accumulated input (prompt) token count.
+const INPUT_TOKENS_KEY: &str = "anthropic_stream.input_tokens";
+
+/// Metadata key for cached input token count.
+const CACHE_READ_TOKENS_KEY: &str = "anthropic_stream.cache_read_tokens";
+
 /// Metadata key for the current content block index.
 const BLOCK_INDEX_KEY: &str = "anthropic_stream.block_index";
 
@@ -76,45 +83,47 @@ const UTF8_BUFFER_KEY: &str = "anthropic_stream.utf8_buffer";
 const ARMED_KEY: &str = "anthropic_stream.armed";
 
 // -----------------------------------------------------------------------------
-// AnthropicStreamEventsFilter
+// AnthropicMessagesToChatCompletionsStreamFilter
 // -----------------------------------------------------------------------------
 
-/// Transforms streaming SSE responses between `OpenAI` and
-/// Anthropic formats, processing each chunk as it arrives.
+/// Transforms streaming SSE responses between the Chat Completions and
+/// Anthropic Messages formats, processing each chunk as it arrives.
 ///
 /// Arms automatically when an upstream classifier or transform
 /// filter sets `anthropic_messages_format.stream` or
-/// `anthropic_to_openai.streaming` metadata to `"true"` and
+/// `anthropic_messages_to_chat_completions.streaming` metadata to `"true"` and
 /// the backend response has `Content-Type: text/event-stream`
-/// (with or without parameters such as `charset=utf-8`).
+/// (with or without parameters such as `charset=utf-8`) and does
+/// not carry a `Content-Encoding` header.
 /// No `response_conditions` configuration is needed.
 ///
 /// # YAML
 ///
 /// ```yaml
-/// filter: anthropic_stream_events
+/// filter: anthropic_messages_to_chat_completions_stream
 /// ```
 ///
 /// # Full YAML
 ///
 /// ```yaml
-/// filter: anthropic_stream_events
+/// filter: anthropic_messages_to_chat_completions_stream
 /// max_partial_event_bytes: 10485760
 /// max_tool_blocks: 10000
 /// ```
-pub struct AnthropicStreamEventsFilter {
+pub struct AnthropicMessagesToChatCompletionsStreamFilter {
     /// Parsed and validated configuration.
-    config: AnthropicStreamEventsConfig,
+    config: AnthropicMessagesToChatCompletionsStreamConfig,
 }
 
-impl AnthropicStreamEventsFilter {
+impl AnthropicMessagesToChatCompletionsStreamFilter {
     /// Create a filter from parsed YAML config.
     ///
     /// # Errors
     ///
     /// Returns [`FilterError`] if the YAML config is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: AnthropicStreamEventsConfig = parse_filter_config("anthropic_stream_events", config)?;
+        let cfg: AnthropicMessagesToChatCompletionsStreamConfig =
+            parse_filter_config("anthropic_messages_to_chat_completions_stream", config)?;
         let validated = build_config(cfg)?;
         Ok(Box::new(Self { config: validated }))
     }
@@ -143,9 +152,9 @@ impl AnthropicStreamEventsFilter {
 }
 
 #[async_trait]
-impl HttpFilter for AnthropicStreamEventsFilter {
+impl HttpFilter for AnthropicMessagesToChatCompletionsStreamFilter {
     fn name(&self) -> &'static str {
-        "anthropic_stream_events"
+        "anthropic_messages_to_chat_completions_stream"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -164,7 +173,8 @@ impl HttpFilter for AnthropicStreamEventsFilter {
         BodyMode::Stream
     }
 
-    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         Ok(FilterAction::Continue)
     }
 
@@ -237,7 +247,7 @@ fn decode_and_process_chunk(
         // Never mix raw upstream bytes into an Anthropic event stream.
         ctx.filter_metadata.remove(LINE_BUFFER_KEY);
         return Err(FilterError::from(
-            "anthropic_stream_events: upstream SSE contains malformed UTF-8",
+            "anthropic_messages_to_chat_completions_stream: upstream SSE contains malformed UTF-8",
         ));
     };
     let Some(valid_bytes) = combined.as_slice().get(..valid_up_to) else {
@@ -370,7 +380,9 @@ fn store_line_buffer(
 
     if buffer.len() > max_partial_event_bytes {
         ctx.filter_metadata.remove(LINE_BUFFER_KEY);
-        let msg = format!("anthropic_stream_events: incomplete SSE event exceeds {max_partial_event_bytes} bytes");
+        let msg = format!(
+            "anthropic_messages_to_chat_completions_stream: incomplete SSE event exceeds {max_partial_event_bytes} bytes"
+        );
         return Err(msg.into());
     }
 
@@ -401,6 +413,15 @@ fn should_arm(ctx: &HttpFilterContext<'_>) -> bool {
         return false;
     }
 
+    let is_encoded = ctx
+        .response_header
+        .as_ref()
+        .is_some_and(|response| response.headers.contains_key(http::header::CONTENT_ENCODING));
+    if is_encoded {
+        debug!("streaming SSE response is encoded; skipping stream transformation");
+        return false;
+    }
+
     let is_success = ctx.response_header.as_ref().is_none_or(|r| r.status.is_success());
     if !is_success {
         debug!("streaming SSE response with non-2xx status; passing through error body");
@@ -417,7 +438,7 @@ fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
         .is_some_and(|v| v == "true")
         || ctx
             .filter_metadata
-            .get("anthropic_to_openai.streaming")
+            .get("anthropic_messages_to_chat_completions.streaming")
             .is_some_and(|v| v == "true")
 }
 
@@ -494,15 +515,27 @@ fn transform_chunk(
         }
     }
 
-    if let Some(ot) = chunk
-        .get("usage")
-        .and_then(|u| u.get("completion_tokens"))
-        .and_then(Value::as_u64)
-    {
-        ctx.set_metadata(OUTPUT_TOKENS_KEY, ot.to_string());
-    }
-
+    extract_usage_tokens(ctx, chunk);
     Ok(())
+}
+
+/// Extract token usage from a chunk and store in filter metadata.
+fn extract_usage_tokens(ctx: &mut HttpFilterContext<'_>, chunk: &Value) {
+    if let Some(usage) = chunk.get("usage") {
+        if let Some(ot) = usage.get("completion_tokens").and_then(Value::as_u64) {
+            ctx.set_metadata(OUTPUT_TOKENS_KEY, ot.to_string());
+        }
+        if let Some(pt) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+            ctx.set_metadata(INPUT_TOKENS_KEY, pt.to_string());
+        }
+        if let Some(ct) = usage
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_u64)
+        {
+            ctx.set_metadata(CACHE_READ_TOKENS_KEY, ct.to_string());
+        }
+    }
 }
 
 /// Emit the initial `message_start` event and mark the stream as started.
@@ -664,7 +697,7 @@ fn emit_tool_block_start(
     let opened = get_tool_block_count(ctx);
     if opened >= max_tool_blocks {
         return Err(format!(
-            "anthropic_stream_events: streaming tool-call content blocks exceed max_tool_blocks ({max_tool_blocks})"
+            "anthropic_messages_to_chat_completions_stream: streaming tool-call content blocks exceed max_tool_blocks ({max_tool_blocks})"
         )
         .into());
     }
@@ -768,11 +801,7 @@ fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
         .get(FINISH_REASON_KEY)
         .map_or("end_turn", |v| map_stop_reason(v));
 
-    let output_tokens: u64 = ctx
-        .filter_metadata
-        .get(OUTPUT_TOKENS_KEY)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let usage = collect_delta_usage(ctx);
 
     emit_event(
         output,
@@ -785,19 +814,37 @@ fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
                 "stop_reason": stop_reason,
                 "stop_sequence": null
             },
-            "usage": message_delta_usage(output_tokens)
+            "usage": usage
         }),
     );
+}
+
+/// Collect token counts from metadata and build the terminal delta usage.
+fn collect_delta_usage(ctx: &HttpFilterContext<'_>) -> MessageDeltaUsage {
+    let output_tokens: u64 = ctx
+        .filter_metadata
+        .get(OUTPUT_TOKENS_KEY)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let prompt_tokens: Option<u64> = ctx.filter_metadata.get(INPUT_TOKENS_KEY).and_then(|v| v.parse().ok());
+
+    let cache_read: Option<u64> = ctx
+        .filter_metadata
+        .get(CACHE_READ_TOKENS_KEY)
+        .and_then(|v| v.parse().ok());
+
+    let input_tokens = prompt_tokens.map(|pt| match cache_read {
+        Some(cached) => pt.saturating_sub(cached),
+        None => pt,
+    });
+
+    MessageDeltaUsage::new(output_tokens, input_tokens, cache_read)
 }
 
 /// Build a schema-complete Anthropic `Message.usage` value.
 fn message_start_usage() -> MessageUsage {
     MessageUsage::new(0, 0, None)
-}
-
-/// Build a schema-complete Anthropic `message_delta.usage` value.
-fn message_delta_usage(output_tokens: u64) -> MessageDeltaUsage {
-    MessageDeltaUsage::new(output_tokens)
 }
 
 /// Map `OpenAI` finish reasons to Anthropic stop reasons.
@@ -944,9 +991,27 @@ mod tests {
     #[test]
     fn default_config_parses() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-        let filter = AnthropicStreamEventsFilter::from_config(&yaml).unwrap();
+        let filter = AnthropicMessagesToChatCompletionsStreamFilter::from_config(&yaml).unwrap();
 
-        assert_eq!(filter.name(), "anthropic_stream_events", "filter name should match");
+        assert_eq!(
+            filter.name(),
+            "anthropic_messages_to_chat_completions_stream",
+            "filter name should match"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_request_prevents_upstream_response_encoding() {
+        let filter = make_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        assert!(
+            ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING),
+            "stream transformation requires an unencoded upstream representation"
+        );
     }
 
     #[test]
@@ -1056,7 +1121,7 @@ mod tests {
     fn message_delta_usage_matches_anthropic_schema() {
         let (filter, mut ctx) = make_filter_and_context();
 
-        let chunk1 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"completion_tokens\":7}}\n\n";
+        let chunk1 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":7}}\n\n";
         let mut body1 = Some(Bytes::from(chunk1));
         drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
 
@@ -1080,13 +1145,63 @@ mod tests {
             &[
                 "cache_creation_input_tokens",
                 "cache_read_input_tokens",
-                "input_tokens",
                 "server_tool_use",
             ],
             "message_delta usage",
         );
         assert_absent_fields(usage, &["output_tokens_details"], "message_delta usage");
         assert_u64_field(usage, "output_tokens", 7, "message_delta usage");
+        assert_u64_field(usage, "input_tokens", 15, "message_delta usage");
+    }
+
+    #[test]
+    fn message_delta_usage_with_cached_tokens() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk1 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":80}}}\n\n";
+        let mut body1 = Some(Bytes::from(chunk1));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let done = "data: [DONE]\n\n";
+        let mut body2 = Some(Bytes::from(done));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let out = String::from_utf8(body2.unwrap().to_vec()).unwrap();
+        let event = event_data(&out, "message_delta");
+        let usage = event.get("usage").unwrap();
+
+        assert_u64_field(usage, "output_tokens", 5, "message_delta usage");
+        assert_u64_field(
+            usage,
+            "input_tokens",
+            20,
+            "input_tokens should exclude cached (100 - 80)",
+        );
+        assert_u64_field(usage, "cache_read_input_tokens", 80, "message_delta usage");
+    }
+
+    #[test]
+    fn message_delta_usage_without_usage_chunk() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk1 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n";
+        let mut body1 = Some(Bytes::from(chunk1));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        let done = "data: [DONE]\n\n";
+        let mut body2 = Some(Bytes::from(done));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let out = String::from_utf8(body2.unwrap().to_vec()).unwrap();
+        let event = event_data(&out, "message_delta");
+        let usage = event.get("usage").unwrap();
+
+        assert_u64_field(usage, "output_tokens", 0, "no usage chunk means zero output_tokens");
+        assert_null_fields(
+            usage,
+            &["input_tokens", "cache_read_input_tokens"],
+            "no usage chunk means null input fields",
+        );
     }
 
     #[test]
@@ -1150,7 +1265,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream; charset=utf-8"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_to_openai.streaming", "true".to_owned());
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1171,7 +1286,7 @@ mod tests {
             http::HeaderValue::from_static("Text/Event-Stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_to_openai.streaming", "true".to_owned());
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1213,7 +1328,7 @@ mod tests {
             http::HeaderValue::from_static("application/json"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_to_openai.streaming", "true".to_owned());
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1229,6 +1344,36 @@ mod tests {
             "non-SSE response should preserve original content type"
         );
         assert!(!is_armed(&ctx), "filter should not arm for non-SSE response");
+    }
+
+    #[tokio::test]
+    async fn encoded_sse_response_passes_through_unchanged() {
+        let filter = make_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut resp = crate::test_utils::make_response();
+        resp.headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        resp.headers
+            .insert(http::header::CONTENT_ENCODING, http::HeaderValue::from_static("gzip"));
+        ctx.response_header = Some(&mut resp);
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
+
+        drop(filter.on_response(&mut ctx).await.unwrap());
+
+        assert!(!is_armed(&ctx), "filter should not arm for an encoded SSE response");
+        assert!(
+            !ctx.response_headers_modified,
+            "encoded SSE response headers should remain unchanged"
+        );
+
+        let encoded = Bytes::from_static(b"\x1f\x8bencoded-sse");
+        let mut body = Some(encoded.clone());
+        drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+        assert_eq!(body, Some(encoded), "encoded SSE bytes should pass through unchanged");
     }
 
     #[tokio::test]
@@ -1378,7 +1523,7 @@ mod tests {
             http::HeaderValue::from_static("text/event-stream"),
         );
         ctx.response_header = Some(&mut resp);
-        ctx.set_metadata("anthropic_to_openai.streaming", "true".to_owned());
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true".to_owned());
 
         drop(filter.on_response(&mut ctx).await.unwrap());
 
@@ -1399,7 +1544,7 @@ mod tests {
     #[test]
     fn unknown_config_field_rejected() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 1048576").unwrap();
-        let result = AnthropicStreamEventsFilter::from_config(&yaml);
+        let result = AnthropicMessagesToChatCompletionsStreamFilter::from_config(&yaml);
 
         assert!(
             result.is_err(),
@@ -1750,7 +1895,7 @@ mod tests {
     #[test]
     fn zero_partial_event_limit_rejected() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("max_partial_event_bytes: 0").unwrap();
-        let result = AnthropicStreamEventsFilter::from_config(&yaml);
+        let result = AnthropicMessagesToChatCompletionsStreamFilter::from_config(&yaml);
 
         assert!(
             result.is_err(),
@@ -1761,7 +1906,7 @@ mod tests {
     #[test]
     fn exceeds_max_partial_event_limit_rejected() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("max_partial_event_bytes: 67108865").unwrap();
-        let result = AnthropicStreamEventsFilter::from_config(&yaml);
+        let result = AnthropicMessagesToChatCompletionsStreamFilter::from_config(&yaml);
 
         assert!(
             result.is_err(),
@@ -1772,7 +1917,7 @@ mod tests {
     #[test]
     fn custom_max_tool_blocks_parses() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_blocks: 5").unwrap();
-        let result = AnthropicStreamEventsFilter::from_config(&yaml);
+        let result = AnthropicMessagesToChatCompletionsStreamFilter::from_config(&yaml);
 
         assert!(
             result.is_ok(),
@@ -1783,7 +1928,7 @@ mod tests {
     #[test]
     fn zero_max_tool_blocks_rejected() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("max_tool_blocks: 0").unwrap();
-        let result = AnthropicStreamEventsFilter::from_config(&yaml);
+        let result = AnthropicMessagesToChatCompletionsStreamFilter::from_config(&yaml);
 
         assert!(result.is_err(), "streaming filter should reject a zero max_tool_blocks");
     }
@@ -1872,12 +2017,12 @@ mod tests {
 
     fn make_filter() -> Box<dyn HttpFilter> {
         let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
-        AnthropicStreamEventsFilter::from_config(&yaml).unwrap()
+        AnthropicMessagesToChatCompletionsStreamFilter::from_config(&yaml).unwrap()
     }
 
     fn make_filter_from_yaml(yaml: &str) -> Box<dyn HttpFilter> {
         let yaml: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-        AnthropicStreamEventsFilter::from_config(&yaml).unwrap()
+        AnthropicMessagesToChatCompletionsStreamFilter::from_config(&yaml).unwrap()
     }
 
     fn make_error_context(status: http::StatusCode) -> (HttpFilterContext<'static>, praxis_filter::Response) {

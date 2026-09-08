@@ -16,13 +16,17 @@ mod aws_sigv4;
 mod azure_ad;
 mod compact;
 mod credential_injection;
+mod external_metering;
 mod file_search_callout;
+mod file_search_chat_completions;
 mod full_flow;
 mod full_flow_agentic;
 #[cfg(feature = "gcp-adc-filter")]
 mod gcp_adc;
 mod guardrails;
+mod guardrails_response;
 mod inference_fallback;
+mod irr_terminal_streaming;
 #[cfg(feature = "http-callout-filter")]
 mod lakera_guard;
 #[cfg(feature = "llmd-ext-proc")]
@@ -61,3 +65,4 @@ mod token_usage_headers;
 mod vector_stores_routing;
 mod vllm_agentic_api;
 mod web_search;
+mod web_search_chat_completions;

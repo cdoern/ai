@@ -2256,11 +2256,8 @@ async fn create_items_with_non_object_item_returns_400() {
     assert_eq!(rejection.status, 400, "non-object item should return 400");
     let resp = rejection_body(&rejection);
     assert!(
-        resp["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("must be a JSON object"),
-        "should mention object requirement"
+        resp["error"]["message"].as_str().unwrap().contains("InputItem"),
+        "non-object errors should identify the InputItem contract: {resp}"
     );
 }
 
@@ -2389,10 +2386,8 @@ async fn create_items_with_non_string_role_returns_400() {
     assert_eq!(rejection.status, 400, "non-string role should return 400");
     let resp = rejection_body(&rejection);
     assert!(
-        resp["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("role must be a string")
+        resp["error"]["message"].as_str().unwrap().contains("InputItem"),
+        "invalid roles should identify the InputItem contract: {resp}"
     );
 }
 
@@ -2417,8 +2412,8 @@ async fn create_items_with_missing_role_returns_400() {
     assert_eq!(rejection.status, 400, "missing role should return 400");
     let resp = rejection_body(&rejection);
     assert!(
-        resp["error"]["message"].as_str().unwrap().contains("role is required"),
-        "missing role error should mention required role: {resp}"
+        resp["error"]["message"].as_str().unwrap().contains("InputItem"),
+        "missing roles should identify the InputItem contract: {resp}"
     );
 }
 
@@ -2443,10 +2438,8 @@ async fn create_items_with_missing_content_returns_400() {
     assert_eq!(rejection.status, 400, "missing content should return 400");
     let resp = rejection_body(&rejection);
     assert!(
-        resp["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("content is required")
+        resp["error"]["message"].as_str().unwrap().contains("InputItem"),
+        "missing content should identify the InputItem contract: {resp}"
     );
 }
 
@@ -2471,10 +2464,8 @@ async fn create_items_with_non_string_non_array_content_returns_400() {
     assert_eq!(rejection.status, 400, "numeric content should return 400");
     let resp = rejection_body(&rejection);
     assert!(
-        resp["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("must be a string or array")
+        resp["error"]["message"].as_str().unwrap().contains("InputItem"),
+        "invalid content should identify the InputItem contract: {resp}"
     );
 }
 
@@ -2515,7 +2506,7 @@ async fn non_message_item_type_skips_normalization() {
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
-        "items": [{"type": "function_call", "name": "test", "arguments": "{}"}]
+        "items": [{"type": "function_call", "call_id": "call_1", "name": "test", "arguments": "{}"}]
     });
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2526,6 +2517,48 @@ async fn non_message_item_type_skips_normalization() {
     assert_eq!(rejection.status, 200, "non-message type should be accepted");
     let resp = rejection_body(&rejection);
     assert_eq!(resp["data"][0]["type"], "function_call");
+}
+
+#[tokio::test]
+async fn conformance_conversations_item_requests_reject_unknown_and_malformed_contracts() {
+    let filter = build_test_filter();
+
+    let req = make_request(Method::POST, "/v1/conversations");
+    let mut ctx = make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(Bytes::from_static(br#"{"items":[{"type":"future_item"}]}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject for invalid initial item, got {action:?}");
+    };
+    assert_eq!(rejection.status, 400, "invalid initial items should be rejected");
+
+    let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
+
+    for (label, item) in [
+        ("unknown", serde_json::json!({"type": "future_item"})),
+        ("malformed", serde_json::json!({"type": "function_call"})),
+    ] {
+        let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
+        let mut ctx = make_filter_context(&req);
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        let mut body = Some(Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"items": [item]})).unwrap(),
+        ));
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        let FilterAction::Reject(rejection) = action else {
+            panic!("expected Reject for {label} item, got {action:?}");
+        };
+        assert_eq!(rejection.status, 400, "{label} item should be rejected");
+        assert_eq!(
+            rejection_body(&rejection)["error"]["type"],
+            "invalid_request_error",
+            "{label} item should use the OpenAI invalid-request shape"
+        );
+    }
+    println!("PRAXIS_CONFORMANCE_OK conversations request_item_contract");
 }
 
 // -----------------------------------------------------------------------------
@@ -3394,7 +3427,7 @@ async fn on_response_body_appends_completed_response() {
         "content": "hello from append"
     })];
     ctx.extensions.insert(ResponsesState {
-        input: input_items,
+        input: input_items.clone(),
         ..ResponsesState::default()
     });
 
@@ -3413,6 +3446,13 @@ async fn on_response_body_appends_completed_response() {
     let mut body = Some(Bytes::from(serde_json::to_vec(&response_json).unwrap()));
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .map(|state| state.input.as_slice()),
+        Some(input_items.as_slice()),
+        "append-back must clone ResponsesState.input without taking or clearing it"
+    );
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items?order=asc"));
     let mut ctx = make_filter_context(&req);
@@ -3424,6 +3464,22 @@ async fn on_response_body_appends_completed_response() {
     let resp = rejection_body(&rejection);
     let items = resp["data"].as_array().unwrap();
     assert_eq!(items.len(), 2, "append-back should persist both input and output items");
+    assert_eq!(
+        items[0]["role"], "user",
+        "request input items must be persisted before response output"
+    );
+    assert_eq!(
+        items[0]["content"][0]["text"], "hello from append",
+        "original request input text must be unchanged"
+    );
+    assert_eq!(
+        items[1]["role"], "assistant",
+        "response output items must follow request input"
+    );
+    assert_eq!(
+        items[1]["content"][0]["text"], "hi from model",
+        "moved response output text must be unchanged"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -11,6 +11,7 @@ mod config;
 mod contracts;
 mod filter;
 mod handlers;
+mod item_schema;
 pub mod openapi;
 pub(crate) mod routes;
 mod validate;
