@@ -834,10 +834,12 @@ mod tests {
 
     #[test]
     fn postgres_rejects_a_single_uppercase_character() {
-        // The DDL folds the whole identifier, so one uppercase byte is enough
-        // to make the created table name differ from the configured one.
         let err = validate_postgres_table_identifiers("test_responseS", "test_conversations").unwrap_err();
-        assert!(err.to_string().contains("must be lowercase"), "{err}");
+        assert!(
+            err.to_string().contains("must be lowercase"),
+            "the DDL folds the whole identifier, so one uppercase byte is enough to make the created \
+             table name differ from the configured one: {err}"
+        );
     }
 
     #[test]
@@ -848,9 +850,7 @@ mod tests {
 
     #[test]
     fn shared_identifier_validation_stays_case_permissive() {
-        // SQLite compares table names case-insensitively, so the shared
-        // validator must keep accepting uppercase. Only the PostgreSQL path
-        // rejects it.
-        validate_identifier("OpenAIResponses").expect("shared validation should not reject uppercase");
+        validate_identifier("OpenAIResponses")
+            .expect("SQLite compares table names case-insensitively, so only the PostgreSQL path rejects uppercase");
     }
 }
