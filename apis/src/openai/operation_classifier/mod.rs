@@ -41,24 +41,6 @@ use crate::openai::{
 /// Filter name as configured in a pipeline.
 const FILTER_NAME: &str = "openai_operation";
 
-/// One operation classified from a request head.
-///
-/// Stored in request extensions so downstream filters share one authoritative
-/// operation identity rather than re-deriving it from the same method and path.
-/// Every field is `'static`; borrowed path parameters remain available through
-/// each family's own matcher.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OpenAiOperationMatch {
-    /// API family that owns the operation.
-    pub family: OpenAiApiFamily,
-
-    /// Stable operation ID.
-    pub operation_id: &'static str,
-
-    /// Transport the operation was reached over.
-    pub transport: OpenAiTransport,
-}
-
 /// Classifies supported OpenAI operations from the request head.
 pub struct OpenaiOperationFilter {
     /// Validated configuration.
@@ -106,6 +88,24 @@ impl OpenaiOperationFilter {
             ctx.request_headers_to_remove.push(name.clone());
         }
     }
+}
+
+/// One operation classified from a request head.
+///
+/// Stored in request extensions so downstream filters share one authoritative
+/// operation identity rather than re-deriving it from the same method and path.
+/// Every field is `'static`; borrowed path parameters remain available through
+/// each family's own matcher.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpenAiOperationMatch {
+    /// API family that owns the operation.
+    pub family: OpenAiApiFamily,
+
+    /// Stable operation ID.
+    pub operation_id: &'static str,
+
+    /// Transport the operation was reached over.
+    pub transport: OpenAiTransport,
 }
 
 #[async_trait]

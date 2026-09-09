@@ -3,11 +3,7 @@
 
 # `openai_operation`
 
-One operation classified from a request head.
-
-## Configuration Notes
-
-Stored in request extensions so downstream filters share one authoritative operation identity rather than re-deriving it from the same method and path. Every field is `'static`; borrowed path parameters remain available through each family's own matcher.
+Classifies supported OpenAI operations from the request head.
 
 ## Configuration
 
