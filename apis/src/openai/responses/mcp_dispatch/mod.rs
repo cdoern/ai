@@ -135,6 +135,10 @@ impl McpDispatchFilter {
             warn!("ResponsesState missing when handling approval");
             return Ok(FilterAction::Continue);
         };
+        // Record execution provenance so `stream_events` may synthesize this
+        // approval item's lifecycle; a bare `accumulated_output` push is not proof
+        // that this filter produced the item.
+        state.locally_executed_output_items.insert(pending.call_id.clone());
         state.accumulated_output.push(approval_event);
 
         // Re-serialize the response body with the new mcp_approval_request event
@@ -209,6 +213,12 @@ impl HttpFilter for McpDispatchFilter {
         for result in results {
             state.messages.push(result.message.clone());
             state.persisted_messages.push(result.message);
+            // Record execution provenance keyed on the item id `stream_events`
+            // reads, so only this locally executed `mcp_call` gains a synthesized
+            // lifecycle.
+            if let Some(id) = result.output_item.get("id").and_then(serde_json::Value::as_str) {
+                state.locally_executed_output_items.insert(id.to_owned());
+            }
             state.accumulated_output.push(result.output_item);
         }
 
@@ -278,17 +288,13 @@ struct PendingApproval {
 // MCP Tool Call Identification
 // -----------------------------------------------------------------------------
 
-/// Extract MCP tool calls from the `tool_calls` list by checking
+/// Borrow the MCP tool calls from the `tool_calls` list by checking
 /// `mcp_tool_map`.
-fn extract_mcp_tool_calls(
-    tool_calls: &[serde_json::Value],
+fn extract_mcp_tool_calls<'a>(
+    tool_calls: &'a [serde_json::Value],
     tool_map: &HashMap<(String, String), serde_json::Value>,
-) -> Vec<serde_json::Value> {
-    tool_calls
-        .iter()
-        .filter(|tc| is_mcp_tool_call(tc, tool_map))
-        .cloned()
-        .collect()
+) -> Vec<&'a serde_json::Value> {
+    tool_calls.iter().filter(|tc| is_mcp_tool_call(tc, tool_map)).collect()
 }
 
 /// Check whether a tool call is an MCP tool call by matching the
@@ -331,7 +337,7 @@ fn find_by_encoded_name<'a>(
 /// first tool call that requires approval, or `None` if all are
 /// approved.
 fn find_approval_required(
-    mcp_calls: &[serde_json::Value],
+    mcp_calls: &[&serde_json::Value],
     tool_map: &HashMap<(String, String), serde_json::Value>,
 ) -> Option<PendingApproval> {
     mcp_calls.iter().find_map(|tc| check_single_approval(tc, tool_map))
@@ -441,7 +447,7 @@ struct McpCallResult {
 /// Execute MCP tool calls — concurrently when `parallel` is true,
 /// sequentially otherwise.
 async fn execute_mcp_calls(
-    mcp_calls: &[serde_json::Value],
+    mcp_calls: &[&serde_json::Value],
     tool_map: &std::sync::Arc<HashMap<(String, String), serde_json::Value>>,
     parallel: bool,
     timeout: Duration,
@@ -457,7 +463,7 @@ async fn execute_mcp_calls(
 /// Execute MCP tool calls concurrently, emitting error results
 /// for any dropped or panicked tasks.
 async fn execute_parallel(
-    mcp_calls: &[serde_json::Value],
+    mcp_calls: &[&serde_json::Value],
     tool_map: &std::sync::Arc<HashMap<(String, String), serde_json::Value>>,
     timeout: Duration,
     allow_loopback: bool,
@@ -465,7 +471,7 @@ async fn execute_parallel(
     let handles: Vec<_> = mcp_calls
         .iter()
         .map(|tc| {
-            let tc = tc.clone();
+            let tc = (*tc).clone();
             let map = std::sync::Arc::clone(tool_map);
             tokio::spawn(async move { execute_single_call(&tc, &map, timeout, allow_loopback).await })
         })
@@ -493,7 +499,7 @@ async fn execute_parallel(
 /// Execute MCP tool calls sequentially, emitting error results
 /// for any calls that produce no result.
 async fn execute_sequential(
-    mcp_calls: &[serde_json::Value],
+    mcp_calls: &[&serde_json::Value],
     tool_map: &std::sync::Arc<HashMap<(String, String), serde_json::Value>>,
     timeout: Duration,
     allow_loopback: bool,
@@ -553,11 +559,9 @@ fn parse_call_arguments(
     server_label: &str,
     tool_name: &str,
 ) -> Result<(serde_json::Value, String), Box<McpCallResult>> {
-    let raw = tool_call
-        .get("arguments")
-        .cloned()
-        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-    normalize_arguments(&raw).map_err(|e| {
+    let empty = serde_json::Value::Object(serde_json::Map::new());
+    let raw = tool_call.get("arguments").unwrap_or(&empty);
+    normalize_arguments(raw).map_err(|e| {
         warn!(tool_name, error = %e, "malformed JSON in tool call arguments");
         Box::new(build_error_result(
             call_id,

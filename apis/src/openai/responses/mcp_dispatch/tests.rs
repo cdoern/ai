@@ -26,6 +26,12 @@ use crate::{
     test_utils::{make_filter_context, make_request},
 };
 
+/// Borrow owned test tool calls the way the filter passes them:
+/// the dispatch and approval paths take calls by reference.
+fn call_refs(calls: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    calls.iter().collect()
+}
+
 // =========================================================================
 // Approval Policy Parsing
 // =========================================================================
@@ -362,7 +368,7 @@ fn find_approval_required_returns_none_when_all_never() {
         json!({"name": "weather__get_weather", "call_id": "call_1"}),
         json!({"name": "docs__search_docs", "call_id": "call_2"}),
     ];
-    assert!(find_approval_required(&calls, &tool_map).is_none());
+    assert!(find_approval_required(&call_refs(&calls), &tool_map).is_none());
 }
 
 #[test]
@@ -372,7 +378,7 @@ fn find_approval_required_returns_first_when_absent() {
         json!({"name": "weather__get_weather", "call_id": "call_1"}),
         json!({"name": "docs__search_docs", "call_id": "call_2"}),
     ];
-    let pending = find_approval_required(&calls, &tool_map).unwrap();
+    let pending = find_approval_required(&call_refs(&calls), &tool_map).unwrap();
     assert_eq!(pending.tool_name, "get_weather");
 }
 
@@ -390,7 +396,7 @@ fn find_approval_required_returns_first_requiring() {
         json!({"name": "weather__get_weather", "call_id": "call_1"}),
         json!({"name": "docs__search_docs", "call_id": "call_2", "arguments": {"query": "rust"}}),
     ];
-    let pending = find_approval_required(&calls, &tool_map).unwrap();
+    let pending = find_approval_required(&call_refs(&calls), &tool_map).unwrap();
     assert_eq!(pending.tool_name, "search_docs");
     assert_eq!(pending.call_id, "call_2");
     assert_eq!(pending.server_label, "docs");
@@ -401,7 +407,7 @@ fn find_approval_required_defaults_to_approval_when_absent() {
     let tool_map = sample_tool_map();
     let calls = vec![json!({"name": "weather__get_weather", "call_id": "call_1"})];
     assert!(
-        find_approval_required(&calls, &tool_map).is_some(),
+        find_approval_required(&call_refs(&calls), &tool_map).is_some(),
         "absent require_approval should default to requiring approval"
     );
 }
@@ -410,7 +416,7 @@ fn find_approval_required_defaults_to_approval_when_absent() {
 fn find_approval_required_ambiguous_tool_requires_approval() {
     let tool_map = lossy_collision_tool_map();
     let calls = vec![json!({"name": "my_server__get", "call_id": "call_1"})];
-    let pending = find_approval_required(&calls, &tool_map);
+    let pending = find_approval_required(&call_refs(&calls), &tool_map);
     assert!(
         pending.is_some(),
         "ambiguous encoded name should require approval even when all servers say never"
@@ -588,6 +594,117 @@ fn content_blocks_to_output_preserves_non_text_losslessly() {
     );
 }
 
+#[test]
+fn content_blocks_to_output_preserves_audio_losslessly() {
+    let blocks = vec![rmcp::model::ContentBlock::audio("base64audiodata", "audio/wav")];
+    let output = content_blocks_to_output(&blocks).unwrap();
+
+    assert!(
+        output.contains("\"type\":\"audio\""),
+        "audio block serialized as JSON: {output}"
+    );
+    assert!(output.contains("base64audiodata"), "audio data preserved: {output}");
+    assert!(output.contains("audio/wav"), "audio mime type preserved: {output}");
+
+    let recovered: Vec<rmcp::model::ContentBlock> =
+        serde_json::from_str(&output).expect("output must be valid JSON content array");
+    assert_eq!(
+        recovered, blocks,
+        "audio content must round-trip losslessly, not be dropped"
+    );
+}
+
+#[test]
+fn content_blocks_to_output_preserves_resource_link_losslessly() {
+    let blocks = vec![rmcp::model::ContentBlock::resource_link(
+        rmcp::model::Resource::new("file:///test.txt", "test.txt")
+            .with_mime_type("text/plain")
+            .with_size(100),
+    )];
+    let output = content_blocks_to_output(&blocks).unwrap();
+
+    assert!(
+        output.contains("\"type\":\"resource_link\""),
+        "resource_link block serialized as JSON: {output}"
+    );
+    assert!(output.contains("file:///test.txt"), "resource uri preserved: {output}");
+    assert!(output.contains("test.txt"), "resource name preserved: {output}");
+
+    let recovered: Vec<rmcp::model::ContentBlock> =
+        serde_json::from_str(&output).expect("output must be valid JSON content array");
+    assert_eq!(
+        recovered, blocks,
+        "resource_link content must round-trip losslessly, not be dropped"
+    );
+}
+
+#[test]
+fn content_blocks_to_output_preserves_mixed_content_ordered() {
+    // A single result carrying text, audio, an embedded resource, and a
+    // resource link must serialize as the compact JSON content array and
+    // deserialize back to the exact same ordered blocks, so no variant is
+    // dropped or reordered when several non-text kinds appear together.
+    let blocks = vec![
+        rmcp::model::ContentBlock::text("summary line"),
+        rmcp::model::ContentBlock::audio("base64audiodata", "audio/wav"),
+        rmcp::model::ContentBlock::resource(rmcp::model::ResourceContents::TextResourceContents {
+            uri: "file:///embedded.txt".to_owned(),
+            mime_type: Some("text/plain".to_owned()),
+            text: "embedded resource body".to_owned(),
+            meta: None,
+        }),
+        rmcp::model::ContentBlock::resource_link(
+            rmcp::model::Resource::new("file:///linked.png", "linked.png")
+                .with_mime_type("image/png")
+                .with_size(2048),
+        ),
+    ];
+    let output = content_blocks_to_output(&blocks).unwrap();
+
+    let recovered: Vec<rmcp::model::ContentBlock> =
+        serde_json::from_str(&output).expect("output must be valid JSON content array");
+    assert_eq!(
+        recovered, blocks,
+        "#1020: mixed text/audio/embedded-resource/resource-link content must \
+         deserialize back to the original ordered array"
+    );
+}
+
+#[test]
+fn process_call_result_preserves_mixed_content_in_both_representations() {
+    // The model-facing `function_call_output` and the client-facing
+    // `mcp_call.output` are both fed from the same serializer, so a mixed
+    // non-text result must reach both representations identically and
+    // losslessly — neither may silently drop a variant.
+    let blocks = vec![
+        rmcp::model::ContentBlock::text("caption"),
+        rmcp::model::ContentBlock::audio("base64audiodata", "audio/wav"),
+        rmcp::model::ContentBlock::resource_link(
+            rmcp::model::Resource::new("file:///doc.pdf", "doc.pdf").with_mime_type("application/pdf"),
+        ),
+    ];
+    let call_result = rmcp::model::CallToolResult::success(blocks.clone());
+    let result = process_call_result(Ok(call_result), "c1", "srv", "tool", "{}");
+
+    let model_facing = result.message["output"]
+        .as_str()
+        .expect("function_call_output output is a string");
+    let client_facing = result.output_item["output"]
+        .as_str()
+        .expect("mcp_call output is a string");
+    assert_eq!(
+        model_facing, client_facing,
+        "model-facing and client-facing representations must carry identical content"
+    );
+
+    let recovered: Vec<rmcp::model::ContentBlock> =
+        serde_json::from_str(client_facing).expect("client-facing output must be a JSON content array");
+    assert_eq!(
+        recovered, blocks,
+        "both representations must round-trip the mixed content to the original ordered array"
+    );
+}
+
 // =========================================================================
 // resolve_tool_entry
 // =========================================================================
@@ -647,9 +764,33 @@ fn parse_call_arguments_malformed_string_returns_error() {
 #[test]
 fn parse_call_arguments_absent_defaults_to_empty_object() {
     let tc = serde_json::json!({"name": "tool"});
-    let (args, _) = parse_call_arguments(&tc, "c1", "srv", "tool").unwrap();
+    let (args, args_str) = parse_call_arguments(&tc, "c1", "srv", "tool").unwrap();
     assert!(args.is_object());
     assert!(args.as_object().unwrap().is_empty());
+    assert_eq!(
+        args_str, "{}",
+        "absent arguments keep the canonical empty-object string"
+    );
+}
+
+#[test]
+fn parse_call_arguments_string_not_double_encoded() {
+    let tc = serde_json::json!({"name": "tool", "arguments": "{\"a\": 1}"});
+    let (_, args_str) = parse_call_arguments(&tc, "c1", "srv", "tool").unwrap();
+    assert_eq!(
+        args_str, "{\"a\": 1}",
+        "string arguments keep their original representation verbatim"
+    );
+}
+
+#[test]
+fn parse_call_arguments_malformed_string_error_keeps_raw_arguments() {
+    let tc = serde_json::json!({"name": "tool", "arguments": "not-json"});
+    let err = parse_call_arguments(&tc, "c1", "srv", "tool").unwrap_err();
+    assert_eq!(
+        err.output_item["arguments"], "not-json",
+        "the malformed raw string must survive into the error body"
+    );
 }
 
 // =========================================================================
@@ -868,7 +1009,7 @@ async fn execute_mcp_calls_sequential() {
     let map = std::sync::Arc::new(sample_tool_map());
     let calls = vec![json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {}})];
     let timeout = std::time::Duration::from_millis(200);
-    let results = execute_mcp_calls(&calls, &map, false, timeout, true).await;
+    let results = execute_mcp_calls(&call_refs(&calls), &map, false, timeout, true).await;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].output_item["type"], "mcp_call");
 }
@@ -878,7 +1019,7 @@ async fn execute_mcp_calls_parallel() {
     let map = std::sync::Arc::new(sample_tool_map());
     let calls = vec![json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {}})];
     let timeout = std::time::Duration::from_millis(200);
-    let results = execute_mcp_calls(&calls, &map, true, timeout, true).await;
+    let results = execute_mcp_calls(&call_refs(&calls), &map, true, timeout, true).await;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].output_item["type"], "mcp_call");
 }
@@ -888,7 +1029,7 @@ async fn execute_mcp_calls_emits_error_for_unknown_tools() {
     let map = std::sync::Arc::new(sample_tool_map());
     let calls = vec![json!({"name": "nonexistent", "call_id": "c1"})];
     let timeout = std::time::Duration::from_millis(100);
-    let results = execute_mcp_calls(&calls, &map, false, timeout, true).await;
+    let results = execute_mcp_calls(&call_refs(&calls), &map, false, timeout, true).await;
     assert_eq!(results.len(), 1);
     assert!(results[0].output_item["error"].as_str().unwrap().contains("no result"));
 }
@@ -898,7 +1039,7 @@ async fn execute_mcp_calls_emits_error_for_unknown_tool_without_call_id() {
     let map = std::sync::Arc::new(sample_tool_map());
     let calls = vec![json!({"name": "nonexistent"})];
     let timeout = std::time::Duration::from_millis(100);
-    let results = execute_mcp_calls(&calls, &map, false, timeout, true).await;
+    let results = execute_mcp_calls(&call_refs(&calls), &map, false, timeout, true).await;
     assert_eq!(results.len(), 1, "must emit error even without call_id");
     assert_eq!(results[0].output_item["id"], "unknown");
     assert!(results[0].output_item["error"].as_str().unwrap().contains("no result"));

@@ -628,7 +628,7 @@ fn resolve_error_action(
         });
         return FilterAction::Continue;
     }
-    FilterAction::Reject(responses_error_rejection(status, error_type, &msg, streaming))
+    FilterAction::Reject(responses_error_rejection(status, error_type, &msg))
 }
 
 /// Compact descriptor of a deferred streaming `tools/list` runtime failure.
@@ -1593,6 +1593,16 @@ fn mcp_tool_to_function_tool(label: &str, definition: &serde_json::Value) -> ser
     let encoded_name = encode_function_name(label, tool_name);
 
     let description = definition.get("description").cloned();
+    // Carry the MCP `inputSchema` into `parameters` verbatim, accepting both
+    // the camelCase spelling from a fresh `tools/list` and the snake_case
+    // `input_schema` spelling stored in a cached `mcp_list_tools` listing so
+    // both provenances rewrite identically.
+    //
+    // The Responses function-tool format has slots only for
+    // `type`/`name`/`description`/`parameters`; an MCP `outputSchema` has no
+    // representation here and is intentionally dropped rather than silently
+    // lost downstream. The model still receives the tool's actual result
+    // content at dispatch time, so the output contract is unaffected.
     let parameters = definition
         .get("inputSchema")
         .or_else(|| definition.get("input_schema"))
