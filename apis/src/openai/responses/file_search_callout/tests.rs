@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use praxis_filter::{FilterAction, HttpFilter};
+use praxis_filter::{BodyMode, FilterAction, HttpFilter, body::MAX_JSON_BODY_BYTES};
 use serde_json::{Value, json};
 
 use super::{
@@ -583,10 +583,62 @@ async fn streaming_file_search_is_rejected_before_callout() {
     let mut ctx = make_context(Some(one_pending_state(&["vs-a"])));
     ctx.set_metadata("openai_responses_format.stream", "true");
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
+    let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
+        panic!("streaming file_search should be rejected before any callout");
+    };
+    assert_eq!(rejection.status, 400, "pre-stream rejection keeps its 4xx status");
+    let content_type = rejection
+        .headers
+        .iter()
+        .find(|(k, _)| k == "content-type")
+        .map(|(_, v)| v.as_str());
+    assert_eq!(
+        content_type,
+        Some("application/json"),
+        "a stream:true pre-stream rejection uses application/json, not text/event-stream"
+    );
+    let body = rejection.body.expect("rejection carries a JSON body");
+    let parsed: serde_json::Value = serde_json::from_slice(&body).expect("body is JSON");
+    assert!(
+        parsed.get("error").is_some_and(serde_json::Value::is_object),
+        "pre-stream rejection body is a JSON error envelope, not an SSE event: {parsed}"
+    );
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn response_body_mode_defaults_to_stream() {
+    let filter = make_filter(1, "");
+    assert_eq!(
+        filter.response_body_mode(),
+        BodyMode::Stream,
+        "the static declaration must be Stream so this filter can compose in a \
+         streaming-capable openai_responses_proxy IRR step without tripping the \
+         StreamBuffer build validation"
+    );
+}
+
+#[tokio::test]
+async fn on_request_selects_bounded_stream_buffer_for_non_streaming() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    // No ResponsesState and stream=false: on_request continues without a callout.
+    let mut ctx = make_context(None);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "non-streaming request should continue"
+    );
+    assert_eq!(
+        ctx.response_body_mode,
+        BodyMode::StreamBuffer {
+            max_bytes: Some(MAX_JSON_BODY_BYTES)
+        },
+        "non-streaming file-search responses must be buffered so capture_response \
+         parses the whole model response object"
+    );
     assert!(server.requests().is_empty());
 }
 
@@ -972,6 +1024,28 @@ async fn max_tool_calls_counts_completed_calls_before_pending_execution() {
 }
 
 #[tokio::test]
+async fn max_tool_calls_counts_reused_ids_from_separate_rounds() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    let pending = json!({"type":"file_search_call","id":"fs-next","status":"searching","queries":["q"]});
+    let mut state = state_with(&["vs-a"], vec![pending]);
+    state.file_search_output_items = vec![
+        json!({"type":"file_search_call","id":"fs-reused","status":"completed"}),
+        json!({"type":"file_search_call","id":"fs-reused","status":"incomplete"}),
+    ];
+    state.max_tool_calls = Some(2);
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.output_items()[0]["status"], "incomplete");
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
 async fn max_tool_calls_counts_completed_calls_in_the_current_output() {
     let server = MockServer::json(200, &json!({"data": []}));
     let filter = make_filter(server.port, "");
@@ -1087,7 +1161,7 @@ fn final_response_rewrite_clears_representation_headers() {
 }
 
 #[tokio::test]
-async fn mcp_calls_do_not_consume_the_builtin_tool_budget() {
+async fn mcp_calls_consume_the_response_wide_builtin_tool_budget() {
     let server = MockServer::json(200, &json!({"data": []}));
     let filter = make_filter(server.port, "");
     let mcp = json!({"type":"mcp_call","id":"mcp-prior","status":"completed"});
@@ -1101,8 +1175,31 @@ async fn mcp_calls_do_not_consume_the_builtin_tool_budget() {
         FilterAction::Continue
     ));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items()[1]["status"], "completed");
-    assert_eq!(server.requests().len(), 1);
+    assert_eq!(state.output_items()[1]["status"], "incomplete");
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn prior_agentic_calls_consume_file_search_budget_across_state_owners() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    let pending = json!({"type":"file_search_call","id":"fs-new","status":"searching","queries":["q"]});
+    let mut state = state_with(&["vs-a"], vec![pending]);
+    state.max_tool_calls = Some(2);
+    state.web_search_calls_executed = 1;
+    state.accumulated_output = vec![
+        json!({"type":"web_search_call", "id":"ws-prior", "status":"completed"}),
+        json!({"type":"mcp_call", "id":"mcp-prior", "status":"completed"}),
+    ];
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.output_items()[0]["status"], "incomplete");
+    assert!(server.requests().is_empty());
 }
 
 #[tokio::test]

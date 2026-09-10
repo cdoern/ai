@@ -9,11 +9,12 @@ mod test_utils;
 pub use test_utils::load_example_config;
 
 mod agentic_routing;
+mod anthropic_full_flow_agentic;
 mod anthropic_messages;
-mod anthropic_messages_web_search;
 mod aws_sigv4;
 #[cfg(feature = "azure-ad-filter")]
 mod azure_ad;
+mod azure_translation;
 mod compact;
 mod credential_injection;
 mod external_metering;
@@ -55,6 +56,7 @@ mod provider_route;
 mod rehydrate;
 mod responses_routing;
 mod responses_to_chat_completions;
+mod responses_to_chat_completions_conformance;
 mod session_replay;
 mod time_to_first_token;
 mod token_count;

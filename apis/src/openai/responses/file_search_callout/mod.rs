@@ -46,7 +46,7 @@ use crate::{
     openai::responses::{
         bounded_json_size,
         error::responses_error_rejection,
-        state::{MAX_CITATION_FILES, ResponsesState},
+        state::{MAX_CITATION_FILES, ResponsesState, consumed_builtin_tool_calls},
         usage::merge_usage,
     },
     subrequest::SubRequestClient,
@@ -215,7 +215,6 @@ impl FileSearchCalloutFilter {
                 502,
                 "server_error",
                 "openai_file_search_callout: continuation output exceeds the JSON response byte limit",
-                false,
             )));
         }
         state
@@ -280,7 +279,6 @@ impl FileSearchCalloutFilter {
             502,
             "server_error",
             &format!("openai_file_search_callout: {}", failure.error),
-            false,
         )))
     }
 
@@ -401,7 +399,6 @@ impl FileSearchCalloutFilter {
                 502,
                 "server_error",
                 "openai_file_search_callout: accumulated output exceeds the JSON response byte limit",
-                false,
             )));
         }
         let completed_output = std::mem::take(state.output_items_mut());
@@ -758,7 +755,6 @@ fn continuation_state_rejection() -> FilterAction {
         413,
         "invalid_request_error",
         "openai_file_search_callout: continuation state exceeds max_state_bytes",
-        false,
     ))
 }
 
@@ -769,7 +765,6 @@ fn invalid_success_response_action(continued: bool) -> FilterAction {
             502,
             "server_error",
             "openai_file_search_callout: inference continuation returned an invalid response",
-            false,
         ))
     } else {
         FilterAction::Continue
@@ -803,7 +798,7 @@ fn finalize_public_response(state: &mut ResponsesState) -> Result<Bytes, FilterA
 
 /// Build a consistent failure while assembling a model's final response.
 fn final_response_rejection(message: &str) -> FilterAction {
-    FilterAction::Reject(responses_error_rejection(502, "server_error", message, false))
+    FilterAction::Reject(responses_error_rejection(502, "server_error", message))
 }
 
 /// Whether a model output requires a client-supplied function result.
@@ -819,7 +814,6 @@ fn mixed_tool_response_rejection() -> FilterAction {
         502,
         "server_error",
         "openai_file_search_callout: a model response cannot combine file_search_call with client-executed function_call",
-        false,
     ))
 }
 
@@ -1120,12 +1114,7 @@ fn remaining_file_search_call_budget(state: &ResponsesState) -> usize {
     let Some(max_tool_calls) = state.max_tool_calls else {
         return MAX_PENDING_CALLS;
     };
-    let used_calls = state
-        .file_search_output_items
-        .iter()
-        .chain(state.output_items())
-        .filter(|item| is_builtin_tool_call(item) && !is_pending_file_search_call(item))
-        .count();
+    let used_calls = consumed_builtin_tool_calls(state);
     usize::try_from(max_tool_calls)
         .unwrap_or(usize::MAX)
         .saturating_sub(used_calls)
@@ -1148,28 +1137,6 @@ fn combined_output_fits(state: &ResponsesState, incoming_response: &Value, max_b
     .ok()
     .flatten()
     .is_some()
-}
-
-/// Return whether an output item is a provider-hosted built-in tool call.
-///
-/// Shared with `openai_web_search`, which counts non-web built-in calls against
-/// the same client-declared `max_tool_calls` budget.
-pub(crate) fn is_builtin_tool_call(item: &Value) -> bool {
-    matches!(
-        item.get("type").and_then(Value::as_str),
-        Some(
-            "apply_patch_call"
-                | "code_interpreter_call"
-                | "computer_call"
-                | "file_search_call"
-                | "image_generation_call"
-                | "local_shell_call"
-                | "multi_agent_call"
-                | "shell_call"
-                | "tool_search_call"
-                | "web_search_call"
-        )
-    )
 }
 
 /// Schedule bounded search coordinates while retaining every pending call.
@@ -1321,7 +1288,6 @@ fn unsupported_streaming_rejection(ctx: &HttpFilterContext<'_>) -> Option<Filter
             400,
             "invalid_request_error",
             "openai_file_search_callout: stream=true is not supported by an iterative file-search pipeline",
-            true,
         ))
     })
 }

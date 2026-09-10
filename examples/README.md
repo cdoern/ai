@@ -52,11 +52,17 @@ before sending requests.
 
 | File | Description |
 | ------ | ------------- |
+| [full-flow-agentic.yaml](configs/anthropic/full-flow-agentic.yaml) | A single Anthropic Messages gateway that runs the server-owned web-search loop through Praxis core's iterative_request_router (IRR) and serves BOTH streaming and buffered clients from one pipeline. `anthropic_web_search` selects the transport per request from the client's `stream` flag (`terminal_streaming: true`) |
 | [messages-protocol.yaml](configs/anthropic/messages-protocol.yaml) | Routes Anthropic Messages API requests to a native `/v1/messages` backend |
 | [messages-to-openai.yaml](configs/anthropic/messages-to-openai.yaml) | Transforms Anthropic Messages API requests and responses for Chat Completions-compatible inference backends |
-| [messages-web-search.yaml](configs/anthropic/messages-web-search.yaml) | Runs a non-streaming native Messages model -> You.com search -> model loop through Praxis core's iterative_request_router |
 | [request-validate.yaml](configs/anthropic/request-validate.yaml) | Rejects empty, malformed, or non-object JSON request bodies |
 | [unified-gateway.yaml](configs/anthropic/unified-gateway.yaml) | Routes traffic by classifier-promoted headers so a single listener handles Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses requests |
+
+### Azure
+
+| File | Description |
+| ------ | ------------- |
+| [chat-completions-to-openai.yaml](configs/azure/chat-completions-to-openai.yaml) | Proxies standard Chat Completions requests to an Azure OpenAI deployment |
 
 ### Inference
 
@@ -84,7 +90,7 @@ before sending requests.
 | [format-routing.yaml](configs/openai/responses/format-routing.yaml) | Routes AI API traffic by detected body format |
 | [full-flow-agentic.yaml](configs/openai/responses/full-flow-agentic.yaml) | Extends the full-flow pipeline with an iterative_request_router (IRR) around the inference step, enabling server-side file search execution |
 | [full-flow.yaml](configs/openai/responses/full-flow.yaml) | Combines conversations, format classification, request validation, file resolution, and backend routing into a single pipeline |
-| [irr-terminal-streaming.yaml](configs/openai/responses/irr-terminal-streaming.yaml) | Demonstrates a single-step iterative_request_router pipeline that exposes a native OpenAI Responses SSE body incrementally. `terminal_streaming: true` lets the final serializer select Praxis's typed streaming transport for an effective `"stream": true` request |
+| [irr-terminal-streaming.yaml](configs/openai/responses/irr-terminal-streaming.yaml) | Demonstrates a single-step iterative_request_router pipeline that exposes a native OpenAI Responses SSE body incrementally. `openai_responses_proxy` always advertises the streaming capability and selects Praxis's typed streaming transport automatically for an effective `"stream": true` request; there is no operator opt-in |
 | [mcp-dispatch.yaml](configs/openai/responses/mcp-dispatch.yaml) | Demonstrates the `openai_mcp_dispatch` filter configuration |
 | [mcp-tool-resolve.yaml](configs/openai/responses/mcp-tool-resolve.yaml) | Demonstrates the `openai_mcp_tool_resolve` filter, which resolves MCP tool entries in the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server |
 | [model-rewrite.yaml](configs/openai/responses/model-rewrite.yaml) | Rewrites or injects the top-level `model` field in Responses API request bodies before forwarding to the inference backend |
