@@ -98,8 +98,10 @@ impl OpenaiOperationFilter {
 /// each family's own matcher.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OpenAiOperationMatch {
-    /// API family that owns the operation, published as its
-    /// [`application_protocol`](OpenAiApiFamily::application_protocol).
+    /// API family that owns the operation.
+    ///
+    /// Published downstream as its provider-qualified application protocol,
+    /// for example `openai_responses`, rather than as the bare family name.
     pub family: OpenAiApiFamily,
 
     /// Stable operation ID.
