@@ -64,8 +64,8 @@ impl OpenaiOperationFilter {
     /// Uses set rather than append semantics so a client-supplied value of the
     /// same name cannot survive alongside the classifier's own.
     fn set_routing_headers(&self, ctx: &mut HttpFilterContext<'_>, matched: OpenAiOperationMatch) {
-        if let Some(name) = &self.config.family_header
-            && let Ok(value) = http::HeaderValue::from_str(matched.family.as_str())
+        if let Some(name) = &self.config.application_protocol_header
+            && let Ok(value) = http::HeaderValue::from_str(matched.family.application_protocol())
         {
             ctx.request_headers_to_set.push((name.clone(), value));
         }
@@ -81,7 +81,7 @@ impl OpenaiOperationFilter {
     /// An unmatched request carries no proxy-owned operation, so any value a
     /// client supplied under these names is stripped rather than forwarded.
     fn remove_routing_headers(&self, ctx: &mut HttpFilterContext<'_>) {
-        if let Some(name) = &self.config.family_header {
+        if let Some(name) = &self.config.application_protocol_header {
             ctx.request_headers_to_remove.push(name.clone());
         }
         if let Some(name) = &self.config.operation_header {
@@ -98,7 +98,8 @@ impl OpenaiOperationFilter {
 /// each family's own matcher.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OpenAiOperationMatch {
-    /// API family that owns the operation.
+    /// API family that owns the operation, published as its
+    /// [`application_protocol`](OpenAiApiFamily::application_protocol).
     pub family: OpenAiApiFamily,
 
     /// Stable operation ID.
@@ -115,8 +116,8 @@ impl HttpFilter for OpenaiOperationFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let transport = request_transport(&ctx.request.headers);
         let method = ctx.request.method.as_str();
+        let transport = request_transport(method, &ctx.request.headers);
         let path = ctx.request.uri.path();
 
         let Some(matched) = classify(method, path, transport) else {
@@ -133,24 +134,36 @@ impl HttpFilter for OpenaiOperationFilter {
         debug!(
             method,
             path,
-            family = matched.family.as_str(),
+            application_protocol = matched.family.application_protocol(),
             operation_id = matched.operation_id,
             transport = matched.transport.as_str(),
             "classified OpenAI operation"
         );
 
-        ctx.extensions.insert(matched);
-        ctx.set_metadata("openai_operation.family", matched.family.as_str());
-        ctx.set_metadata("openai_operation.operation_id", matched.operation_id);
-
-        let results = ctx.filter_results.entry(FILTER_NAME).or_default();
-        results.set("family", matched.family.as_str())?;
-        results.set("operation_id", matched.operation_id)?;
-
+        publish_match(ctx, matched)?;
         self.set_routing_headers(ctx, matched);
 
         Ok(FilterAction::Continue)
     }
+}
+
+/// Publish a match as request extensions, metadata, and filter results.
+///
+/// The extension carries the typed identity for downstream filters, the
+/// metadata is for logging and tracing, and the filter results are what
+/// `on_result` branch conditions evaluate.
+fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: OpenAiOperationMatch) -> Result<(), FilterError> {
+    let application_protocol = matched.family.application_protocol();
+
+    ctx.extensions.insert(matched);
+    ctx.set_metadata("openai_operation.application_protocol", application_protocol);
+    ctx.set_metadata("openai_operation.operation_id", matched.operation_id);
+
+    let results = ctx.filter_results.entry(FILTER_NAME).or_default();
+    results.set("application_protocol", application_protocol)?;
+    results.set("operation_id", matched.operation_id)?;
+
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -187,14 +200,21 @@ fn classify(method: &str, path: &str, transport: OpenAiTransport) -> Option<Open
 /// Determine the transport a request arrived over.
 ///
 /// A `WebSocket` handshake is a `GET` carrying the opening handshake from
-/// [RFC 6455 Section 4.1]. `Connection` is a token list per
+/// [RFC 6455 Section 4.1]. The method check is part of that definition, not an
+/// optimization: without it, upgrade headers attached to a non-`GET` request
+/// such as `POST /v1/responses` would select `WebSocket` transport and leave an
+/// otherwise valid operation unclassified. `Connection` is a token list per
 /// [RFC 9110 Section 7.6.1], so comma-separated and repeated field lines both
 /// count. Exactly one `Upgrade` value is accepted, so a request nominating
 /// several protocols is not treated as a `WebSocket` handshake.
 ///
 /// [RFC 6455 Section 4.1]: https://datatracker.ietf.org/doc/html/rfc6455#section-4.1
 /// [RFC 9110 Section 7.6.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-7.6.1
-fn request_transport(headers: &http::HeaderMap) -> OpenAiTransport {
+fn request_transport(method: &str, headers: &http::HeaderMap) -> OpenAiTransport {
+    if method != http::Method::GET.as_str() {
+        return OpenAiTransport::Http;
+    }
+
     let connection_upgrades = headers
         .get_all(http::header::CONNECTION)
         .iter()

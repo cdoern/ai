@@ -10,5 +10,5 @@ Classifies supported OpenAI operations from the request head.
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `headers` | OperationHeaders | no | Header names for the classified operation. |
-| `headers.family` | string | no | Header name for the API family. `null` disables the header. |
+| `headers.application_protocol` | string | no | Header name for the application protocol. `null` disables the header. |
 | `headers.operation` | string | no | Header name for the operation ID. `null` disables the header. |
