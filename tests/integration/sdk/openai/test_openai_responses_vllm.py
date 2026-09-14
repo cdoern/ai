@@ -47,7 +47,7 @@ VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-0.6B")
 OGX_BASE_URL = os.environ.get("OGX_BASE_URL", "http://127.0.0.1:8321")
 PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-CONFIG_PATH = "examples/configs/openai/responses/full-flow.yaml"
+CONFIG_PATH = "examples/configs/openai/responses/full-flow-agentic.yaml"
 AGENTIC_CONFIG_PATH = "examples/configs/openai/responses/agentic-loop.yaml"
 IRR_STREAMING_CONFIG_PATH = (
     "examples/configs/openai/responses/irr-terminal-streaming.yaml"
@@ -129,6 +129,11 @@ def _write_config(praxis_port: int, db_path: str) -> str:
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     config = config.replace("127.0.0.1:3001", _vllm_endpoint())
     config = config.replace("127.0.0.1:9999", _ogx_endpoint())
+    # The unified gateway wires openai_web_search into the IRR; its config
+    # resolves ${WEB_SEARCH_API_KEY} at startup and fails closed when unset.
+    # These vLLM turns never emit a web_search_call, so a literal placeholder
+    # key keeps the dispatcher inert while letting the binary start.
+    config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
     config = _patch_store_backend(config, db_path)
 
     fd, path = tempfile.mkstemp(suffix=".yaml")
@@ -331,6 +336,15 @@ class MCPHandler(BaseHTTPRequestHandler):
 
     authorization_headers: ClassVar[list[str | None]] = []
 
+    _tool_call_count = 0
+    _tool_call_count_lock = threading.Lock()
+
+    @classmethod
+    def tool_call_count(cls) -> int:
+        """Return the number of tool calls received by this test process."""
+        with cls._tool_call_count_lock:
+            return cls._tool_call_count
+
     def do_POST(self):
         type(self).authorization_headers.append(self.headers.get("Authorization"))
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
@@ -389,6 +403,8 @@ class MCPHandler(BaseHTTPRequestHandler):
                 },
             )
         elif method == "tools/call":
+            with self._tool_call_count_lock:
+                type(self)._tool_call_count += 1
             params = req.get("params", {})
             tool_name = params.get("name")
             city = params.get("arguments", {}).get("city", "unknown")
@@ -527,6 +543,87 @@ class CompactionHandler(BaseHTTPRequestHandler):
         pass
 
 
+class ResponsesWitnessHandler(BaseHTTPRequestHandler):
+    """Recording shim that sits between Praxis and the native vLLM backend.
+
+    Captures the JSON body of every request the backend receives, then forwards
+    it transparently to real vLLM and streams the response back so the full
+    native Responses pipeline still completes. Tests use the captured bodies to
+    assert on what the proxy actually forwards upstream after its rewrites
+    (rehydration, ``previous_response_id`` stripping, ``truncation`` passthrough).
+    """
+
+    forwarded_bodies: ClassVar[list[dict]] = []
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _forward(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        if body:
+            try:
+                type(self).forwarded_bodies.append(json.loads(body))
+            except json.JSONDecodeError:
+                pass
+        headers = {
+            k: v
+            for k, v in self.headers.items()
+            if k.lower() not in ("host", "content-length")
+        }
+        url = f"{VLLM_BASE_URL.rstrip('/')}{self.path}"
+        with httpx.Client(timeout=300.0) as client:
+            with client.stream(
+                self.command, url, headers=headers, content=body
+            ) as upstream:
+                self.send_response(upstream.status_code)
+                for key, value in upstream.headers.items():
+                    if key.lower() in (
+                        "transfer-encoding",
+                        "content-length",
+                        "connection",
+                    ):
+                        continue
+                    self.send_header(key, value)
+                self.end_headers()
+                for chunk in upstream.iter_raw():
+                    if chunk:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+
+    def do_POST(self):
+        self._forward()
+
+    def do_GET(self):
+        self._forward()
+
+
+def _write_witness_config(
+    praxis_port: int,
+    db_path: str,
+    backend_port: int,
+) -> str:
+    """Patch full-flow-agentic.yaml to route the native backend through the shim.
+
+    Identical to :func:`_write_config` except the ``127.0.0.1:3001`` backend is
+    pointed at the recording shim (which forwards to vLLM) instead of vLLM
+    directly, so a test can observe the exact request bodies the backend sees.
+    """
+    with open(CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
+    config = config.replace("127.0.0.1:9999", _ogx_endpoint())
+    config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
+    config = _patch_store_backend(config, db_path)
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
 def _write_agentic_config(
     praxis_port: int,
     db_path: str,
@@ -545,6 +642,12 @@ def _write_agentic_config(
         '- "127.0.0.1:3001"',
         f'- "{vllm}"\n                    read_timeout_ms: 300000',
     )
+    # agentic-loop.yaml is the canonical unified config (#1046): it wires all
+    # three request-phase dispatchers (web_search, mcp_dispatch,
+    # file_search_callout) under the single agentic-loop owner. Retarget the
+    # file-search vector store at OGX so the file-search dispatcher is live here
+    # too; it stays inert for web/mcp-only tests that emit no file_search_call.
+    config = config.replace("http://127.0.0.1:8001", f"http://{_ogx_endpoint()}")
     config = _patch_store_backend(config, db_path)
     config = config.replace(
         "- filter: openai_mcp_tool_resolve\n",
@@ -560,8 +663,9 @@ def _write_agentic_config(
     )
     config = config.replace(
         "max_iterations: 11\n",
+        # agentic-loop.yaml already sets the IRR's overall ``timeout_ms``;
+        # inject only ``step_timeout_ms`` here to avoid a duplicate key.
         "max_iterations: 11\n"
-        "        timeout_ms: 300000\n"
         "        step_timeout_ms: 300000\n",
     )
     config = config.replace(
@@ -768,6 +872,69 @@ def compact_proxy(tmp_path_factory, request, compaction_server):
                     file=sys.stderr,
                 )
         os.unlink(config_path)
+
+
+def _witness_proxy_session(tmp_path_factory, request):
+    """Start a proxy whose native backend is a recording shim in front of vLLM.
+
+    Shared generator body for the witness fixtures. Yields ``(client,
+    forwarded_bodies)`` where ``forwarded_bodies`` accumulates the JSON bodies
+    the vLLM Responses backend receives, letting a test assert on the request
+    the proxy actually forwards upstream after its rewrites.
+    """
+    ResponsesWitnessHandler.forwarded_bodies = []
+    forwarded = ResponsesWitnessHandler.forwarded_bodies
+    backend_port = _free_port()
+    server = HTTPServer(("127.0.0.1", backend_port), ResponsesWitnessHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("responses-witness")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_witness_config(port, db_path, backend_port)
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        client = OpenAI(
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="test",
+            max_retries=0,
+            timeout=300,
+        )
+        yield client, forwarded
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        server.shutdown()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Witness backend Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture()
+def witness_backend_client(tmp_path_factory, request):
+    """Function-scoped witness proxy with the stock rehydrate config."""
+    yield from _witness_proxy_session(tmp_path_factory, request)
 
 
 @pytest.fixture(scope="session")
@@ -1147,6 +1314,69 @@ class TestOpenAIResponsesVLLM:
             f"request; got: {second.previous_response_id!r}"
         )
 
+    def test_truncation_forwarded_to_backend_through_rehydration(
+        self, witness_backend_client
+    ):
+        """Issue #532: the caller's ``truncation`` must reach the native backend
+        on both a fresh turn and a rehydrated continuation.
+
+        The unit test only proves ``truncation`` survives into ``ResponsesState``
+        before the proxy rewrites the outbound body. This drives the full native
+        pipeline against a recording shim in front of vLLM to prove the backend
+        actually *receives* the value on both turns:
+
+        * turn 1 sends ``truncation="auto"`` — forwarded verbatim (no rewrite);
+        * turn 2 rehydrates via ``previous_response_id`` and sends
+          ``truncation="disabled"`` — the proxy replays history into ``input``
+          and strips ``previous_response_id``, but must still forward the
+          caller's ``truncation``.
+
+        Guarding both spec values through the rewrite path is exactly what #532
+        requires: process conversation history without dropping client-supplied
+        request settings.
+        """
+        client, forwarded = witness_backend_client
+
+        before_first = len(forwarded)
+        first = client.responses.create(
+            model=VLLM_MODEL,
+            input="Remember this nonce: TRUNCATE-4821. Acknowledge it. /no_think",
+            temperature=0,
+            truncation="auto",
+            store=True,
+            max_output_tokens=128,
+        )
+        assert first.status == "completed"
+        assert first.truncation == "auto"
+
+        first_seen = forwarded[before_first:]
+        assert first_seen, "backend received no request on the first turn"
+        first_backend = first_seen[-1]
+        assert first_backend.get("truncation") == "auto", first_backend
+
+        before_second = len(forwarded)
+        second = client.responses.create(
+            model=VLLM_MODEL,
+            input="What nonce did I tell you? Repeat it exactly. /no_think",
+            temperature=0,
+            previous_response_id=first.id,
+            truncation="disabled",
+            store=True,
+            max_output_tokens=128,
+        )
+        assert second.status == "completed"
+        assert second.truncation == "disabled"
+
+        second_seen = forwarded[before_second:]
+        assert second_seen, "backend received no request on the rehydrated turn"
+        second_backend = second_seen[-1]
+        # The caller's truncation survives the outbound-body rewrite...
+        assert second_backend.get("truncation") == "disabled", second_backend
+        # ...while previous_response_id is stripped and history is replayed
+        # into `input` instead.
+        assert second_backend.get("previous_response_id") is None, second_backend
+        assert isinstance(second_backend.get("input"), list), second_backend
+
     def test_conversation_context_and_append_back(self, openai_client):
         conversation = openai_client.conversations.create(
             metadata={"suite": "responses-vllm"},
@@ -1343,6 +1573,41 @@ class TestOpenAIResponsesVLLM:
             f"previous_response_id; got: {lifecycle_previous_ids}"
         )
 
+        # Issue #1150: the persisted record (served by GET) must agree with the
+        # terminal frame the client observed. The streaming persistence source is
+        # an independent ResponsesState.response_object that the incremental wire
+        # rewrite never touches, so before the fix the stored response echoed the
+        # backend's null even though the streamed terminal carried first.id.
+        retrieved = _retrieve_with_retry(openai_client, final_response.id)
+        assert retrieved.previous_response_id == first.id, (
+            "the stored streaming response must persist the caller's "
+            "previous_response_id, matching the terminal frame the client saw; "
+            f"got: {retrieved.previous_response_id!r}"
+        )
+
+    @pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streaming"])
+    def test_conflicting_history_selectors_error_shape(self, openai_client, stream):
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="next",
+                previous_response_id="resp_previous",
+                conversation="conv_existing",
+                stream=stream,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400
+        assert error.body == {
+            "code": "mutually_exclusive_parameters",
+            "message": (
+                "Mutually exclusive parameters. Ensure you are only providing "
+                "one of: 'previous_response_id' or 'conversation'."
+            ),
+            "param": None,
+            "type": "invalid_request_error",
+        }
+
     def test_doc_extract_inline_file_to(self, openai_client):
         """Issue #397: inline file_data is extracted to input_text and
         consumed by vLLM inference.
@@ -1449,9 +1714,12 @@ class TestOpenAIResponsesVLLM:
     def test_client_function_call_returns(self, openai_client):
         """Client-side function tools are returned without auto-execution.
 
-        The full-flow pipeline has no agentic loop, so function_call
-        items are passed through to the client. Validates that vLLM
-        produces a well-formed function_call through the proxy.
+        The unified agentic pipeline's openai_agentic_loop only auto-executes
+        hosted tools (file_search, web_search, MCP); a bare client-side
+        function_call has no hosted dispatcher, so the loop terminates
+        (action=done) and passes the function_call through to the client.
+        Validates that vLLM produces a well-formed function_call through the
+        proxy.
         """
         response = openai_client.responses.create(
             model=VLLM_MODEL,
@@ -2236,6 +2504,208 @@ def _assert_multi_round_usage_and_trace(response, *, transport):
 class TestAgenticLoopVLLM:
     """Integration tests for the agentic loop against a vLLM backend."""
 
+    def test_mcp_approval_round_trip_executes_once(
+        self, agentic_client, agentic_proxy,
+    ):
+        """An SDK approval response resumes and executes the MCP call once."""
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": "always",
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        approval_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        approval_requests = [
+            item for item in approval_response.output
+            if item.type == "mcp_approval_request"
+        ]
+        assert len(approval_requests) == 1, (
+            "approval-gated MCP call should emit exactly one approval request; "
+            f"got: {[item.type for item in approval_response.output]}"
+        )
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the MCP tool must not execute before approval"
+        )
+
+        approval = approval_requests[0]
+        assert approval.name == "get_weather"
+        assert approval.server_label == "weather"
+
+        final_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            previous_response_id=approval_response.id,
+            input=[
+                {
+                    "type": "mcp_approval_response",
+                    "approval_request_id": approval.id,
+                    "approve": True,
+                }
+            ],
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        assert MCPHandler.tool_call_count() == calls_before + 1, (
+            "approving the request must execute the MCP tool exactly once"
+        )
+        output_types = [item.type for item in final_response.output]
+        assert "mcp_call" in output_types, (
+            f"approved response should contain the MCP result; got: {output_types}"
+        )
+        # The resume must re-enter inference after dispatch; a small model under
+        # /no_think and a 512-token cap may surface only reasoning and no final
+        # message, so accept either as proof the tool result fed back into the model.
+        assert "message" in output_types or "reasoning" in output_types, (
+            f"approved response should resume to model output; got: {output_types}"
+        )
+
+    def test_mcp_approval_resume_streams_without_index_error(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #637 (PR #1029 review): a streamed approval RESUME must
+        announce every locally seeded output item before a delta references it.
+
+        The approval resume runs *before* the first inference round. Tool
+        discovery (``openai_mcp_tool_resolve``) seeds the ``mcp_list_tools``
+        listing at accumulated output index 0 (issue #1022), the executed
+        mcp_call lands at index 1, and the resumed model output follows at
+        index 2+. Every one of those slots must be announced with a
+        ``response.output_item.added`` before a delta references it: if the
+        proxy skips index 0 or 1, the OpenAI SDK's streaming accumulator never
+        allocates that slot, so a later model item is appended one slot short
+        and the next delta indexes past the end of the list, raising
+        ``IndexError`` mid-stream -- the exact crash this test guards against.
+
+        Turn 1 is buffered to obtain the approval request id; the RESUME turn
+        streams through the SDK's ``responses.stream`` accumulator, which is the
+        surface that raised the regression. Reaching ``get_final_response()``
+        without an exception is itself the primary assertion.
+        """
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "weather",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather"],
+                "require_approval": "always",
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        approval_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        )
+        approval_requests = [
+            item for item in approval_response.output
+            if item.type == "mcp_approval_request"
+        ]
+        assert len(approval_requests) == 1, (
+            "approval-gated MCP call should emit exactly one approval request; "
+            f"got: {[item.type for item in approval_response.output]}"
+        )
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "the MCP tool must not execute before approval"
+        )
+        approval = approval_requests[0]
+
+        # RESUME turn: stream through the SDK accumulator. Building the final
+        # snapshot from the event sequence is exactly what raised IndexError
+        # before the index-0 mcp_call was announced; letting any such exception
+        # propagate fails the test with the regression's own traceback.
+        added = []  # (output_index, item_type, item_id)
+        text_delta_indices = []
+        with agentic_client.responses.stream(
+            model=VLLM_MODEL,
+            previous_response_id=approval_response.id,
+            input=[
+                {
+                    "type": "mcp_approval_response",
+                    "approval_request_id": approval.id,
+                    "approve": True,
+                }
+            ],
+            tools=tools,
+            store=True,
+            max_output_tokens=512,
+        ) as stream:
+            for event in stream:
+                if event.type == "response.output_item.added":
+                    item = event.item.model_dump()
+                    added.append(
+                        (event.output_index, item.get("type"), item.get("id"))
+                    )
+                elif event.type == "response.output_text.delta":
+                    text_delta_indices.append(event.output_index)
+            # Replays the accumulated snapshot; raises if any delta referenced
+            # an output index that was never announced with output_item.added.
+            final_response = stream.get_final_response()
+
+        assert MCPHandler.tool_call_count() == calls_before + 1, (
+            "approving the request must execute the MCP tool exactly once"
+        )
+
+        # Tool discovery seeds the mcp_list_tools listing at index 0 (issue
+        # #1022); it must be announced so the accumulator allocates slot 0 ahead
+        # of the resumed tool activity.
+        list_added = [a for a in added if a[1] == "mcp_list_tools"]
+        assert list_added and list_added[0][0] == 0, (
+            "the mcp_list_tools discovery listing must be announced at output "
+            f"index 0 ahead of the resumed tool activity; got: {added}"
+        )
+
+        # The locally executed mcp_call is announced as exactly one incremental
+        # output_item.added at index 1 -- directly after the discovery listing,
+        # the slot the accumulator needs before the resumed model output.
+        mcp_added = [a for a in added if a[1] == "mcp_call"]
+        assert len(mcp_added) == 1, (
+            "the resumed mcp_call should surface as exactly one "
+            f"response.output_item.added; got: {added}"
+        )
+        mcp_index = mcp_added[0][0]
+        assert mcp_index == 1, (
+            "the resumed mcp_call executes before the first inference round but "
+            "after tool discovery, so it must be announced at output index 1 "
+            f"(behind the mcp_list_tools listing at index 0); got index {mcp_index}"
+        )
+
+        # Any resumed model text streams at an output index after the index-1
+        # mcp_call -- the ordering the accumulator relies on. (Empty is fine: a
+        # small model under /no_think + a 512-token cap may emit only reasoning.)
+        assert all(idx > mcp_index for idx in text_delta_indices), (
+            "resumed model text must stream at an output index after the "
+            f"index-1 mcp_call; mcp_index={mcp_index}, deltas={text_delta_indices}"
+        )
+
+        output_types = [item.type for item in final_response.output]
+        assert "mcp_call" in output_types, (
+            f"resumed response should contain the MCP result; got: {output_types}"
+        )
+
     def test_mcp_tool_auto_executes_and_returns(
         self,
         agentic_client,
@@ -2376,7 +2846,9 @@ class TestAgenticLoopVLLM:
                     "require_approval": "always",
                 }
             ],
-            store=False,
+            # Approval round trips need durable state to resume, so the proxy
+            # requires store=true; store=false is rejected before emit.
+            store=True,
             max_output_tokens=256,
         )
 
@@ -2415,7 +2887,9 @@ class TestAgenticLoopVLLM:
                     "require_approval": "always",
                 }
             ],
-            store=False,
+            # Approval round trips need durable state to resume, so the proxy
+            # requires store=true; store=false is rejected before emit.
+            store=True,
             max_output_tokens=256,
         )
 
@@ -2449,7 +2923,9 @@ class TestAgenticLoopVLLM:
                     "require_approval": "always",
                 }
             ],
-            store=False,
+            # Approval round trips need durable state to resume, so the proxy
+            # requires store=true; store=false is rejected before emit.
+            store=True,
             max_output_tokens=256,
         )
 
@@ -2837,6 +3313,249 @@ class TestAgenticLoopVLLM:
         ), (
             "the terminal snapshot must agree with the streamed mcp_call "
             f"(id={mcp_id!r}, index={mcp_index}); got snapshot: {snapshot}"
+        )
+
+    def test_mcp_discovery_surfaces_mcp_list_tools_output_item(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #1022: successful local MCP discovery surfaces as an output item.
+
+        ``openai_mcp_tool_resolve`` already exposes a *failed* ``mcp_list_tools``
+        item (#320). This proves the complementary success path: a resolved
+        ``tools/list`` emits exactly one ``mcp_list_tools`` output item per server
+        in the buffered terminal response, ahead of the tool activity it enabled,
+        with a null error and the discovered tools in ``MCPListToolsTool`` shape.
+        Tool *selection* still depends on the model, but the discovery item is
+        emitted from the proxy's own resolution and is model-independent.
+        """
+        _, mcp_port, _ = agentic_proxy
+        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
+
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "server_url": mcp_url,
+                    "allowed_tools": ["get_weather"],
+                    "require_approval": "never",
+                }
+            ],
+            store=False,
+            max_output_tokens=512,
+        )
+
+        assert response.status in ("completed", "incomplete"), (
+            f"expected completed or incomplete (token limit); got: {response.status}"
+        )
+
+        output = [item.model_dump() for item in response.output]
+        list_items = [item for item in output if item.get("type") == "mcp_list_tools"]
+        assert len(list_items) == 1, (
+            "successful discovery must emit exactly one mcp_list_tools item; "
+            f"got output types: {[i.get('type') for i in output]}"
+        )
+        listing = list_items[0]
+        assert listing.get("id", "").startswith("mcpl_"), listing
+        assert listing["server_label"] == "weather", listing
+        assert listing.get("error") is None, (
+            f"a successful discovery listing must carry a null error; got: {listing}"
+        )
+        tool_names = {tool.get("name") for tool in listing.get("tools", [])}
+        assert "get_weather" in tool_names, (
+            f"the discovery listing must expose the discovered tool; got: {listing}"
+        )
+        get_weather = next(
+            tool for tool in listing["tools"] if tool.get("name") == "get_weather"
+        )
+        assert isinstance(get_weather.get("input_schema"), dict), (
+            f"each discovered tool must carry an input_schema object; got: {get_weather}"
+        )
+
+        # The discovery listing leads the accumulated output, ahead of the tool
+        # activity it enabled: its index precedes the first function_call/mcp_call.
+        output_types = [item.get("type") for item in output]
+        list_index = output_types.index("mcp_list_tools")
+        first_tool_index = next(
+            (i for i, t in enumerate(output_types) if t in ("function_call", "mcp_call")),
+            None,
+        )
+        assert first_tool_index is not None, (
+            f"discovery should precede tool activity; got: {output_types}"
+        )
+        assert list_index < first_tool_index, (
+            "the mcp_list_tools discovery item must precede the tool activity it "
+            f"enabled; got: {output_types}"
+        )
+
+    def test_mcp_discovery_streams_mcp_list_tools_lifecycle(
+        self, agentic_client, agentic_proxy,
+    ):
+        """Issue #1022: successful discovery streams a full mcp_list_tools lifecycle.
+
+        The buffered sibling above asserts the terminal snapshot carries the
+        ``mcp_list_tools`` item; that snapshot alone does not prove the client
+        saw discovery live. This asserts the intermediate events #1022 adds: the
+        successful listing is synthesized -- ahead of any model output -- as one
+        ``output_item.added`` -> ``mcp_list_tools.in_progress`` ->
+        ``mcp_list_tools.completed`` -> ``output_item.done`` lifecycle, exactly
+        once (no re-emission across IRR rounds), with ids/indices/sequence
+        numbers that agree with the terminal snapshot. This is what turns an
+        opaque terminal listing into discovery progress the client can render.
+        """
+        _, mcp_port, _ = agentic_proxy
+        mcp_url = f"http://127.0.0.1:{mcp_port}/mcp"
+
+        stream = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the get_weather function for Paris. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=[
+                {
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "server_url": mcp_url,
+                    "allowed_tools": ["get_weather"],
+                    "require_approval": "never",
+                }
+            ],
+            store=False,
+            stream=True,
+            max_output_tokens=512,
+        )
+
+        added = []  # (position, output_index, item_type, item_id, item, sequence_number)
+        done = []   # (output_index, item_type, item_id, sequence_number)
+        # (type, item_id, output_index, seq) for the discovery-specific events.
+        list_progress = []
+        final_response = None
+
+        for position, event in enumerate(stream):
+            etype = event.type
+            if etype == "response.output_item.added":
+                item = event.item.model_dump()
+                added.append(
+                    (position, event.output_index, item.get("type"), item.get("id"),
+                     item, event.sequence_number)
+                )
+            elif etype == "response.output_item.done":
+                item = event.item.model_dump()
+                done.append(
+                    (event.output_index, item.get("type"), item.get("id"),
+                     event.sequence_number)
+                )
+            elif etype in (
+                "response.mcp_list_tools.in_progress",
+                "response.mcp_list_tools.completed",
+                "response.mcp_list_tools.failed",
+            ):
+                list_progress.append(
+                    (etype, event.item_id, event.output_index, event.sequence_number)
+                )
+            elif etype == "response.completed":
+                final_response = event.response
+
+        assert final_response is not None, (
+            "stream must terminate with a response.completed event"
+        )
+
+        # #1022 core: the successful discovery surfaces as exactly one incremental
+        # output_item.added. Without the synthesis it appears only in the terminal
+        # snapshot -- so this is the assertion that fails when #1022 is absent.
+        list_added = [a for a in added if a[2] == "mcp_list_tools"]
+        assert len(list_added) == 1, (
+            "successful discovery should surface as exactly one "
+            f"response.output_item.added; got incremental added items: "
+            f"{[(a[1], a[2], a[3]) for a in added]}"
+        )
+        _, list_index, _, list_id, list_item, list_added_seq = list_added[0]
+        assert list_id and list_id.startswith("mcpl_"), (
+            f"synthesized mcp_list_tools must carry an mcpl_ id; got: {list_id!r}"
+        )
+        assert list_item.get("server_label") == "weather", list_item
+        assert list_item.get("error") is None, (
+            f"a successful discovery listing must carry a null error; got: {list_item}"
+        )
+        assert any(
+            tool.get("name") == "get_weather" and isinstance(tool.get("input_schema"), dict)
+            for tool in list_item.get("tools", [])
+        ), f"the streamed listing must carry the discovered tool: {list_item}"
+
+        # Exactly one matching output_item.done for the same id: proves the
+        # listing is not re-emitted across IRR rounds and that the pair is closed.
+        list_done = [d for d in done if d[1] == "mcp_list_tools" and d[2] == list_id]
+        assert len(list_done) == 1, (
+            "the discovery listing should be closed by exactly one "
+            f"output_item.done for id {list_id!r}; got done items: {done}"
+        )
+        assert list_done[0][0] == list_index, (
+            "output_item.done must reuse the added item's output_index; "
+            f"added index={list_index}, done index={list_done[0][0]}"
+        )
+
+        # Between the generic output-item pair the listing must emit in_progress
+        # then completed (discovery succeeds, so never failed), all keyed by the
+        # same item id and sharing its output index.
+        prog = [p for p in list_progress if p[1] == list_id]
+        prog_types = [p[0] for p in prog]
+        assert prog_types.count("response.mcp_list_tools.in_progress") == 1, (
+            "the discovery listing must emit exactly one in_progress event for "
+            f"id {list_id!r}; got progress events: {list_progress}"
+        )
+        assert prog_types.count("response.mcp_list_tools.completed") == 1, (
+            "a successful discovery must emit exactly one completed event for "
+            f"id {list_id!r}; got progress events: {list_progress}"
+        )
+        assert "response.mcp_list_tools.failed" not in prog_types, (
+            "a successful discovery must not emit a failed event; "
+            f"got progress events: {list_progress}"
+        )
+        for _, _, prog_index, _ in prog:
+            assert prog_index == list_index, (
+                "discovery progress events must share the listing's output index; "
+                f"listing index={list_index}, progress={list_progress}"
+            )
+        in_progress_seq = next(
+            p[3] for p in prog if p[0] == "response.mcp_list_tools.in_progress"
+        )
+        completed_seq = next(
+            p[3] for p in prog if p[0] == "response.mcp_list_tools.completed"
+        )
+        assert (
+            list_added_seq < in_progress_seq < completed_seq < list_done[0][3]
+        ), (
+            "mcp_list_tools events must be ordered added -> in_progress -> "
+            f"completed -> done by sequence_number; added={list_added_seq}, "
+            f"in_progress={in_progress_seq}, completed={completed_seq}, "
+            f"done={list_done[0][3]}"
+        )
+
+        # Discovery precedes all model/tool output: it is the very first
+        # output_item.added in the logical stream.
+        assert added[0][3] == list_id, (
+            "the discovery listing must be the first announced output item, ahead "
+            f"of any model output; got added order: {[(a[2], a[3]) for a in added]}"
+        )
+
+        # Snapshot agrees with the stream: the terminal response.completed carries
+        # the same listing (same id) at the same output index it was streamed at.
+        snapshot = [
+            (idx, item.type, item.id)
+            for idx, item in enumerate(final_response.output)
+        ]
+        assert any(
+            item_type == "mcp_list_tools" and item_id == list_id and idx == list_index
+            for idx, item_type, item_id in snapshot
+        ), (
+            "the terminal snapshot must agree with the streamed mcp_list_tools "
+            f"(id={list_id!r}, index={list_index}); got snapshot: {snapshot}"
         )
 
     def test_web_search_streams_local_call_as_incremental_output_items(
@@ -3312,6 +4031,7 @@ filter_chains:
     filters:
       - filter: openai_responses_format
       - filter: openai_responses_validate
+      - filter: openai_tool_parse
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 8
@@ -3325,7 +4045,11 @@ filter_chains:
         steps:
           - name: inference
             filters:
-              - filter: openai_tool_parse
+              # Request-phase dispatcher: at request-body EOS on each IRR
+              # re-entry it executes the file_search_call items the loop owner
+              # assigned in the prior response, reconciling each in place. It
+              # never parses the response and never drives the IRR transition
+              # (#1046).
               - filter: openai_file_search_callout
                 vector_store_url: http://{ogx_endpoint}
                 allow_private_url: true
@@ -3336,6 +4060,11 @@ filter_chains:
                 on_failure: closed
                 forward_headers:
                   - authorization
+              # Sole loop owner: parses each model response, records file-search
+              # assignments for the dispatcher, and publishes the single
+              # continuation signal (action=loop|done).
+              - filter: openai_agentic_loop
+                max_infer_iters: 7
               - filter: openai_responses_proxy
                 name: inference
               - filter: headers
@@ -3353,9 +4082,9 @@ filter_chains:
                     endpoints:
                       - "{vllm_endpoint}"
             on_result:
-              - filter: openai_file_search_callout
-                key: pending
-                value: "true"
+              - filter: openai_agentic_loop
+                key: action
+                value: loop
                 next: inference
               - default: true
                 done: true
@@ -3712,6 +4441,225 @@ class TestFileSearchChatCompletionsVLLM:
         assert marker in payload, (
             "OGX search results (via include=file_search_call.results) should "
             f"contain the indexed marker {marker!r}; got: {payload}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Streaming hosted file search (issue #313)
+# ---------------------------------------------------------------------------
+
+FILE_SEARCH_STREAMING_CONFIG_PATH = (
+    "examples/configs/openai/responses/file-search-streaming.yaml"
+)
+
+
+def _write_file_search_streaming_config(praxis_port: int) -> str:
+    """Patch the shipped file-search-streaming example for testing.
+
+    Exercises the real #313 streaming example config (per repo test
+    requirements) while retargeting the vector-store callout at OGX and the
+    model backend at vLLM's native /v1/responses endpoint. The shipped
+    example ships tight deadlines suited to a fast provider; CPU-only vLLM
+    under co-located CI load (postgres + vLLM + OGX) needs the wider budgets
+    already used by the agentic and non-streaming file-search fixtures.
+    """
+    with open(FILE_SEARCH_STREAMING_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:8001", _ogx_endpoint())
+    # Retarget the model backend and give it a generous read timeout, matching
+    # _write_agentic_config. This is also the only occurrence of :3001.
+    config = config.replace(
+        '- "127.0.0.1:3001"',
+        f'- "{_vllm_endpoint()}"\n'
+        "                    read_timeout_ms: 300000",
+    )
+    # Widen the IRR and callout deadlines for slow CPU inference/search.
+    config = config.replace("timeout_ms: 120000", "timeout_ms: 300000")
+    config = config.replace("step_timeout_ms: 60000", "step_timeout_ms: 300000")
+    config = config.replace("timeout_ms: 5000", "timeout_ms: 30000")
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
+@pytest.fixture(scope="session")
+def file_search_streaming_proxy(tmp_path_factory, request):
+    """Start a Praxis proxy with the streaming file-search-callout pipeline."""
+    port = _free_port()
+    config_path = _write_file_search_streaming_config(port)
+    binary = _find_binary()
+
+    log_dir = tmp_path_factory.mktemp("file-search-streaming")
+    log_path = str(log_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== File search streaming proxy logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def file_search_streaming_client(file_search_streaming_proxy):
+    """Return an OpenAI client pointed at the streaming file-search proxy."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{file_search_streaming_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+def _drain_response_stream(stream):
+    """Consume a Responses SSE stream.
+
+    Returns the ordered event types, every output item announced via
+    output_item.added/.done, and the terminal response status.
+    """
+    event_types = []
+    output_items = []
+    terminal_status = None
+    for event in stream:
+        event_types.append(event.type)
+        if event.type in (
+            "response.output_item.added",
+            "response.output_item.done",
+        ):
+            output_items.append(event.item)
+        if event.type in ("response.completed", "response.incomplete"):
+            terminal_status = event.response.status
+    return event_types, output_items, terminal_status
+
+
+class TestFileSearchStreamingVLLM:
+    """Issue #313: streaming hosted file_search (stream=True).
+
+    Unlike TestFileSearchVLLM (buffered), this drives the #313 streaming
+    example config: openai_stream_events(logical_stream) + openai_file_search_callout
+    + openai_responses_proxy (streaming transport auto-derived from
+    stream=True). vLLM emits a private
+    function_call(name=file_search), which the callout suppresses and replaces
+    with a synthesized file_search_call lifecycle, runs the OGX search, and
+    streams a terminal re-inference round -- all collapsed onto a single
+    client-visible SSE response envelope.
+    """
+
+    _INPUT = (
+        "Use the file_search tool to find information about the Praxis "
+        "marker. Repeat the marker exactly. /no_think"
+    )
+
+    def test_streaming_file_search_lifecycle_events(
+        self, file_search_streaming_client, vector_store
+    ):
+        """The hosted file_search lifecycle is synthesized onto the stream."""
+        store_id, _marker = vector_store
+        stream = file_search_streaming_client.responses.create(
+            model=VLLM_MODEL,
+            input=self._INPUT,
+            tools=[{"type": "file_search", "vector_store_ids": [store_id]}],
+            include=["file_search_call.results"],
+            store=False,
+            stream=True,
+            max_output_tokens=512,
+        )
+
+        event_types, output_items, terminal_status = _drain_response_stream(
+            stream
+        )
+
+        assert event_types, "stream should yield at least one event"
+        assert event_types[0] == "response.created", event_types
+        assert event_types[-1] in (
+            "response.completed",
+            "response.incomplete",
+        ), event_types
+        assert terminal_status in ("completed", "incomplete"), terminal_status
+
+        assert "response.file_search_call.completed" in event_types, (
+            "streaming hosted file_search must emit the completed lifecycle "
+            f"event; got: {event_types}"
+        )
+
+        file_search_items = [
+            item for item in output_items if item.type == "file_search_call"
+        ]
+        assert file_search_items, (
+            "a hosted file_search_call item must be announced on the stream; "
+            f"got event types: {event_types}"
+        )
+        for item in file_search_items:
+            assert item.status in ("searching", "completed", "incomplete"), (
+                "file_search_call status should be a known lifecycle state; "
+                f"got: {item.status}"
+            )
+
+    def test_streaming_file_search_single_logical_stream(
+        self, file_search_streaming_client, vector_store
+    ):
+        """The search round and terminal round collapse into one envelope."""
+        store_id, _marker = vector_store
+        stream = file_search_streaming_client.responses.create(
+            model=VLLM_MODEL,
+            input=self._INPUT,
+            tools=[{"type": "file_search", "vector_store_ids": [store_id]}],
+            include=["file_search_call.results"],
+            store=False,
+            stream=True,
+            max_output_tokens=512,
+        )
+
+        event_types, output_items, _status = _drain_response_stream(stream)
+
+        # The #756/#313 logical stream unifies the search round and the
+        # terminal re-inference round into ONE client-visible envelope.
+        assert event_types.count("response.created") == 1, (
+            "multiple model rounds must collapse to a single response.created; "
+            f"got: {event_types}"
+        )
+        terminal_count = sum(
+            1
+            for t in event_types
+            if t in ("response.completed", "response.incomplete")
+        )
+        assert terminal_count == 1, (
+            "the logical stream must emit exactly one terminal response event; "
+            f"got: {event_types}"
+        )
+
+        # The private function used to drive the search must never surface to
+        # the client as a function_call.
+        leaked = [
+            item for item in output_items if item.type == "function_call"
+        ]
+        assert not leaked, (
+            "the hosted file_search must not leak as a client function_call; "
+            f"leaked: {[getattr(item, 'name', '?') for item in leaked]}"
         )
 
 

@@ -1,18 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Accumulates state from native Responses API SSE event streams.
+//! Composes the current iterative-request-router (IRR) execution into
+//! one logical Responses API SSE stream.
 //!
-//! Parses backend SSE chunks using [`SseFrameParser`], dispatches
-//! typed events to update [`ResponsesState`] in request extensions.
-//! With `logical_stream: true`, successive IRR inference streams are
-//! normalized into one downstream Responses lifecycle.
+//! Parses backend SSE chunks using [`SseFrameParser`], dispatches typed
+//! events to update [`ResponsesState`] in request extensions, and
+//! normalizes successive IRR inference streams into one downstream
+//! Responses lifecycle. A single inference round is just a one-round
+//! logical stream, so the filter always normalizes. It must run inside
+//! an `iterative_request_router` step; running it anywhere else is a
+//! misconfiguration and fails closed at request time.
 //!
 //! [`SseFrameParser`]: crate::openai::sse::SseFrameParser
 //! [`ResponsesState`]: super::state::ResponsesState
 
 pub(crate) mod accumulator;
 mod config;
+mod local_tools;
 
 use std::{
     collections::{BTreeSet, hash_map::DefaultHasher},
@@ -23,8 +28,8 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SubRequestResponseMode,
-    parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState,
+    SubRequestResponseMode, parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, trace, warn};
@@ -37,7 +42,7 @@ use crate::{
     is_event_stream_content_type,
     openai::{
         responses::{
-            error::responses_error_sse_payload,
+            error::{responses_error_rejection, responses_error_sse_payload},
             state::{EmittedItem, ResponsesState},
         },
         sse::{SseFrame, SseFrameParser, SseParseError, SseParserConfig, responses::ResponsesEvent},
@@ -64,7 +69,6 @@ pub(super) enum CompletionState {
 }
 
 /// Per-request parser and accumulation state.
-#[expect(clippy::struct_excessive_bools, reason = "independent per-request stream flags")]
 pub(super) struct StreamEventsState {
     /// Byte-level SSE frame parser.
     frame_parser: SseFrameParser,
@@ -86,8 +90,6 @@ pub(super) struct StreamEventsState {
     rejected_tool_call_args: std::collections::HashSet<String>,
     /// Cap on accumulated bytes per tool-call argument string.
     max_tool_call_argument_bytes: usize,
-    /// Whether this parser normalizes an IRR multi-round logical stream.
-    logical_stream: bool,
     /// Inference iteration number for lifecycle suppression and index offsets.
     iteration: u32,
     /// Output index offset contributed by preceding inference/tool rounds.
@@ -102,16 +104,22 @@ pub(super) struct StreamEventsState {
     /// most once per round rather than re-serializing every local item ahead of
     /// each resumed event.
     local_items_flushed: bool,
+    /// Locally-executable tool items opened this round, keyed by `item:{id}` and
+    /// `index:{output_index}` → suppression mode (§4.1). Transient per-round: created
+    /// in `arm()`, dropped when the state is removed at `finalize_logical_stream`.
+    local_tool_items: std::collections::HashMap<String, local_tools::LocalToolMode>,
 }
 
-/// Accumulates state from native Responses API SSE event streams.
+/// Composes the current IRR execution into one logical Responses stream.
+///
+/// Must run inside an `iterative_request_router` step. Running it
+/// elsewhere is a misconfiguration and fails closed at request time.
 ///
 /// # YAML
 ///
 /// ```yaml
 /// filter: openai_stream_events
 /// # All fields optional:
-/// # logical_stream: false
 /// # max_buffer_bytes: 10485760
 /// # max_events: 100000
 /// # timeout_secs: 300
@@ -122,8 +130,6 @@ pub struct OpenaiStreamEventsFilter {
     parser_config: SseParserConfig,
     /// Cap on accumulated bytes per tool-call argument string.
     max_tool_call_argument_bytes: usize,
-    /// Normalize successive IRR turns into one logical Responses stream.
-    logical_stream: bool,
 }
 
 impl OpenaiStreamEventsFilter {
@@ -133,13 +139,21 @@ impl OpenaiStreamEventsFilter {
     ///
     /// Returns [`FilterError`] if the YAML config is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        Ok(Box::new(Self::build(config)?))
+    }
+
+    /// Build the concrete filter from parsed YAML config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the YAML config is invalid.
+    fn build(config: &serde_yaml::Value) -> Result<Self, FilterError> {
         let cfg: StreamEventsConfig = parse_filter_config("openai_stream_events", config)?;
         cfg.validate()?;
-        Ok(Box::new(Self {
+        Ok(Self {
             parser_config: cfg.to_parser_config(),
             max_tool_call_argument_bytes: cfg.max_tool_call_argument_bytes(),
-            logical_stream: cfg.logical_stream,
-        }))
+        })
     }
 
     /// Whether per-request parser state has been installed.
@@ -152,11 +166,17 @@ impl OpenaiStreamEventsFilter {
         let (iteration, output_index_offset) = ctx.extensions.get_mut::<ResponsesState>().map_or((0, 0), |state| {
             let output_index_offset = u64::try_from(state.accumulated_output.len()).unwrap_or(u64::MAX);
             // Invalidate the previous round's terminal response object before a
-            // resumed round begins. Only this round's own terminal event may
-            // repopulate it; otherwise a provider `error` in the resumed round
-            // would leave the prior round's completed response live and let the
-            // store persist stale success as the logical result.
-            state.response_object = Value::Null;
+            // resumed round begins. Move it instead of dropping it: a request-side
+            // dispatcher can terminate locally (approval/tool limit) before a new
+            // upstream response exists and still needs the response metadata to
+            // encode `response.completed`. Once upstream response headers arrive,
+            // `on_response` drops this fallback so a later provider `error` cannot
+            // persist stale success as the logical result.
+            if state.response_object.is_object() {
+                state.local_completion_response_template = std::mem::take(&mut state.response_object);
+            } else {
+                state.response_object = Value::Null;
+            }
             (state.iteration, output_index_offset)
         });
         ctx.insert_filter_state(StreamEventsState {
@@ -170,22 +190,90 @@ impl OpenaiStreamEventsFilter {
             tool_call_args: std::collections::HashMap::new(),
             rejected_tool_call_args: std::collections::HashSet::new(),
             max_tool_call_argument_bytes: self.max_tool_call_argument_bytes,
-            logical_stream: self.logical_stream,
             iteration,
             output_index_offset,
             deferred_terminal: None,
             deferred_done: false,
             local_items_flushed: false,
+            local_tool_items: std::collections::HashMap::new(),
         });
         ctx.set_metadata("responses.stream_completion", "open");
         // Publish a per-round marker that `openai_agentic_loop` reads (and then
         // consumes) to confirm this typed-streaming round can surface
-        // loop-terminal errors through `finalize_logical_stream`. Only meaningful
-        // when `logical_stream` is enabled; refreshed every round because the
-        // agentic loop overwrites it after each check.
-        if self.logical_stream {
-            ctx.set_metadata("responses.logical_stream", "true");
+        // loop-terminal errors through `finalize_logical_stream`. Refreshed
+        // every armed round because the agentic loop overwrites it after each
+        // check.
+        ctx.set_metadata("responses.logical_stream", "true");
+    }
+
+    /// Apply the guard [`ArmDecision`], returning an early [`FilterAction`] when
+    /// the request must be rejected before any upstream dispatch.
+    ///
+    /// The pure [`arm_decision`] classifies the request; this applies the
+    /// effects that need the context — installing parser state, stripping
+    /// `Accept-Encoding`, or building the fail-closed rejection.
+    fn apply_arm_decision(&self, ctx: &mut HttpFilterContext<'_>, decision: ArmDecision) -> Option<FilterAction> {
+        match decision {
+            ArmDecision::Ignore => None,
+            ArmDecision::RejectOutsideIrr => {
+                // The filter always composes the current IRR execution into one
+                // logical Responses stream, so it must run inside an
+                // `iterative_request_router` step. A missing `IterationState`
+                // means the filter is placed outside IRR — a server
+                // misconfiguration. Fail closed before any upstream dispatch
+                // rather than emit an unnormalized stream that later
+                // loop-terminal errors could not correct.
+                warn!("openai_stream_events is not inside an iterative_request_router step");
+                Some(FilterAction::Reject(responses_error_rejection(
+                    500,
+                    "server_error",
+                    "openai_stream_events must run inside an iterative_request_router step",
+                )))
+            },
+            ArmDecision::Arm => {
+                trace!("arming stream_events for streaming Responses API request");
+                self.arm(ctx);
+                // The SSE frame parser consumes raw bytes, so a compressed
+                // upstream body would be parsed as opaque data — suppressing the
+                // stream and failing an otherwise valid request. Strip
+                // `Accept-Encoding` whenever logical parsing is armed so a
+                // compliant backend returns plaintext SSE.
+                ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
+                None
+            },
         }
+    }
+}
+
+/// Outcome of the request-phase IRR-placement guard.
+///
+/// Factored out of [`OpenaiStreamEventsFilter`]'s `on_request` so the guard's
+/// fail-closed decision table — the invariant that logical composition only
+/// arms inside an `iterative_request_router` step — is exhaustively unit
+/// testable. The runtime signal it depends on, an [`IterationState`] in request
+/// extensions, cannot be constructed outside praxis-filter (its fields are
+/// private), so the end-to-end arming effect is covered by functional
+/// integration tests while this pure decision is covered directly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArmDecision {
+    /// Not a streaming Responses create request; leave the stream untouched.
+    Ignore,
+    /// Streaming Responses request placed outside IRR; reject fail-closed.
+    RejectOutsideIrr,
+    /// Streaming Responses request inside IRR; arm logical composition.
+    Arm,
+}
+
+/// Decide whether to arm logical composition for the current request.
+///
+/// Arms only for a streaming Responses create request, and only inside an IRR
+/// step; the same request outside IRR fails closed rather than emit an
+/// unnormalized stream that later loop-terminal errors could not correct.
+const fn arm_decision(is_streaming_responses: bool, inside_irr: bool) -> ArmDecision {
+    match (is_streaming_responses, inside_irr) {
+        (false, _) => ArmDecision::Ignore,
+        (true, true) => ArmDecision::Arm,
+        (true, false) => ArmDecision::RejectOutsideIrr,
     }
 }
 
@@ -204,11 +292,9 @@ impl HttpFilter for OpenaiStreamEventsFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        if self.logical_stream {
-            BodyAccess::ReadWrite
-        } else {
-            BodyAccess::ReadOnly
-        }
+        // Always ReadWrite: the filter normalizes every armed stream into one
+        // logical Responses lifecycle, rewriting per-round SSE bytes.
+        BodyAccess::ReadWrite
     }
 
     fn response_body_mode(&self) -> BodyMode {
@@ -217,18 +303,31 @@ impl HttpFilter for OpenaiStreamEventsFilter {
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let typed_streaming = ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming;
+        // The `iterative_request_router` runner moves request extensions into
+        // each step but builds a fresh `filter_metadata` map, so metadata set by
+        // pre-IRR filters (e.g. `openai_responses_format`) is not visible here.
+        // `ResponsesState` is created pre-IRR and travels through extensions, so
+        // fall back to it for format and stream detection — mirroring how
+        // `responses_to_chat_completions` resolves `request_is_streaming`.
+        let responses_state = ctx.extensions.get::<ResponsesState>();
+        let has_responses_state = responses_state.is_some();
+        let body_stream = responses_state
+            .and_then(|state| state.request_body.get("stream"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let is_responses = is_responses_create(&ctx.request.method, ctx.request.uri.path())
-            && (typed_streaming || ctx.get_metadata("openai_responses_format.format") == Some("openai_responses"));
-        let is_streaming = typed_streaming || ctx.get_metadata("openai_responses_format.stream") == Some("true");
-
-        if is_responses && is_streaming {
-            trace!("arming stream_events for streaming Responses API request");
-            self.arm(ctx);
-            // The SSE frame parser consumes raw bytes, so a compressed upstream
-            // body would be parsed as opaque data — suppressing the stream and
-            // failing an otherwise valid request. Strip `Accept-Encoding` whenever
-            // logical parsing is armed so a compliant backend returns plaintext SSE.
-            ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
+            && (typed_streaming
+                || ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+                || has_responses_state);
+        let is_streaming =
+            typed_streaming || ctx.get_metadata("openai_responses_format.stream") == Some("true") || body_stream;
+        // `IterationState` is inserted by the IRR runner before the request phase
+        // of every iteration (including iteration 0), so its presence is the
+        // runtime signal that the filter is placed inside an IRR step.
+        let inside_irr = ctx.extensions.get::<IterationState>().is_some();
+        let decision = arm_decision(is_responses && is_streaming, inside_irr);
+        if let Some(action) = self.apply_arm_decision(ctx, decision) {
+            return Ok(action);
         }
 
         Ok(FilterAction::Continue)
@@ -237,6 +336,13 @@ impl HttpFilter for OpenaiStreamEventsFilter {
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if !Self::is_armed(ctx) {
             return Ok(FilterAction::Continue);
+        }
+
+        // A real upstream response now owns this round's terminal lifecycle.
+        // The request-side fallback is no longer reachable and retaining it
+        // could leave stale success metadata live after an upstream error.
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.local_completion_response_template = Value::Null;
         }
 
         if !is_success_sse_response(ctx) {
@@ -310,7 +416,7 @@ fn handle_parse_result(
     let parsed = match parsed {
         Ok(parsed) => parsed,
         Err(error) => {
-            handle_parse_error(ctx, body, state, &error);
+            handle_parse_error(ctx, body, &error);
             return;
         },
     };
@@ -320,29 +426,20 @@ fn handle_parse_result(
         CompletionState::Error => "error",
     };
     ctx.set_metadata("responses.stream_completion", completion);
-    if state.logical_stream {
-        *body = parsed;
-    }
+    *body = parsed;
 }
 
 /// Record a parse failure and suppress unnormalized logical-stream bytes.
-fn handle_parse_error(
-    ctx: &mut HttpFilterContext<'_>,
-    body: &mut Option<Bytes>,
-    state: &StreamEventsState,
-    error: &SseParseError,
-) {
+fn handle_parse_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, error: &SseParseError) {
     warn!(%error, "SSE parse error in stream_events");
     ctx.set_metadata("responses.stream_parse_error", "true".to_owned());
-    if state.logical_stream {
-        ctx.set_metadata("responses.stream_error_code", "server_error");
-        ctx.set_metadata(
-            "responses.stream_error_message",
-            "upstream Responses stream could not be parsed",
-        );
-        ctx.set_metadata("responses.skip_persist", "true");
-        *body = None;
-    }
+    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.set_metadata(
+        "responses.stream_error_message",
+        "upstream Responses stream could not be parsed",
+    );
+    ctx.set_metadata("responses.skip_persist", "true");
+    *body = None;
 }
 
 /// Parse frames from raw bytes and accumulate events.
@@ -369,10 +466,7 @@ fn parse_and_accumulate(
     let events = parse_chunk_events(state, &frames, now)?;
     let logical_output = commit_chunk_events(state, ctx, events);
 
-    Ok(state
-        .logical_stream
-        .then(|| Bytes::from(logical_output))
-        .filter(|bytes| !bytes.is_empty()))
+    Ok((!logical_output.is_empty()).then(|| Bytes::from(logical_output)))
 }
 
 /// Phase 1: parse and validate every frame in a chunk before any mutation.
@@ -388,9 +482,7 @@ fn parse_chunk_events(
     let mut events = Vec::with_capacity(frames.len());
     for frame in frames {
         if frame.data == b"[DONE]" {
-            if state.logical_stream {
-                state.deferred_done = true;
-            }
+            state.deferred_done = true;
             continue;
         }
 
@@ -405,8 +497,7 @@ fn parse_chunk_events(
 /// Phase 2: commit accumulation and logical emission for a fully parsed chunk.
 ///
 /// Both steps are infallible, so every recorded milestone corresponds to bytes
-/// that actually reach the client. Returns the logical-stream bytes (empty when
-/// the logical stream is disabled).
+/// that actually reach the client. Returns the logical-stream bytes.
 fn commit_chunk_events(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
@@ -415,17 +506,14 @@ fn commit_chunk_events(
     let mut logical_output = Vec::new();
     for event in events {
         accumulate_event(ctx, state, &event);
-        if state.logical_stream {
-            append_logical_event(state, ctx, event, &mut logical_output);
-        }
+        append_logical_event(state, ctx, event, &mut logical_output);
     }
 
     // Mirror the parser's deferred-`[DONE]` decision into shared response state,
     // but only now that the whole chunk has parsed and committed. Filter-local
     // parser state is re-armed before request-side dispatchers run on the next
     // IRR step, so the sentinel must survive in shared state as well.
-    if state.logical_stream
-        && state.deferred_done
+    if state.deferred_done
         && let Some(response_state) = ctx.extensions.get_mut::<ResponsesState>()
     {
         response_state.deferred_stream_done = true;
@@ -434,13 +522,103 @@ fn commit_chunk_events(
     logical_output
 }
 
+/// Whether an event is a response lifecycle-creation event
+/// (`response.created`/`queued`/`in_progress`).
+///
+/// These open the logical response and must be emitted exactly once, ahead of any
+/// output item: at `iteration > 0` a resumed round suppresses them (the first round
+/// already sent them), and at `iteration 0` they precede a locally executed item's
+/// synthesized flush.
+fn is_response_lifecycle_creation(event: &ResponsesEvent) -> bool {
+    matches!(
+        event,
+        ResponsesEvent::ResponseCreated(_) | ResponsesEvent::ResponseQueued(_) | ResponsesEvent::ResponseInProgress(_)
+    )
+}
+
 /// Append one provider event to the logical stream or defer/suppress it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear sequence: file_search suppression + deferred-delta gate + seven event type arms, each with its own payload normalization"
+)]
 fn append_logical_event(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
     event: ResponsesEvent,
     output: &mut Vec<u8>,
 ) {
+    // #313 §4/§6: classify locally-executable file_search items at first sight and
+    // suppress their raw wire representation. Only runs on the logical stream with a
+    // hosted file_search tool declared (the load-bearing configured-tool gate, P1 round-11).
+    let file_search_active = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .is_some_and(crate::openai::responses::file_search_callout::has_file_search_tool);
+    if file_search_active && event.event_type() == "response.output_item.added" {
+        let payload = event.payload();
+        if let Some(item) = payload.get("item") {
+            use crate::openai::responses::file_search_callout::{
+                is_file_search_function_call, is_pending_file_search_call,
+            };
+            if is_file_search_function_call(item) {
+                local_tools::register_local_tool(
+                    &mut state.local_tool_items,
+                    payload,
+                    local_tools::LocalToolMode::Suppress,
+                );
+            } else if is_pending_file_search_call(item) {
+                local_tools::register_local_tool(
+                    &mut state.local_tool_items,
+                    payload,
+                    local_tools::LocalToolMode::NativeHybridPending,
+                );
+            }
+        }
+    }
+    // Mode-aware suppression: Suppress drops all events; NativeHybridPending drops only
+    // a still-PENDING output_item.done (EOS synthesizes the completed tail), but passes
+    // through terminal done (completed/failed/incomplete) and removes keys (cancels synthesis).
+    if !state.local_tool_items.is_empty() {
+        let keys: Vec<String> = local_tools::event_local_tool_keys(event.payload()).collect();
+        if let Some(mode) = keys.iter().find_map(|k| state.local_tool_items.get(k).copied()) {
+            match mode {
+                local_tools::LocalToolMode::Suppress => return,
+                local_tools::LocalToolMode::NativeHybridPending => {
+                    if event.event_type() == "response.output_item.done" {
+                        let status = event
+                            .payload()
+                            .get("item")
+                            .and_then(|item| item.get("status"))
+                            .and_then(Value::as_str);
+                        if matches!(status, Some("searching" | "in_progress")) {
+                            return; // still-pending done: EOS synthesizes the completed tail.
+                        }
+                        // Terminal done (completed/failed/incomplete): pass through and
+                        // cancel EOS synthesis — the provider resolved the call. Record the
+                        // item id so the file_search EOS reconcile skips re-queuing this
+                        // call; a synthesized tail would duplicate this live done (#313 P1).
+                        // Recorded for every terminal status, not just `completed`.
+                        if let Some(id) = event
+                            .payload()
+                            .get("item")
+                            .and_then(|item| item.get("id"))
+                            .and_then(Value::as_str)
+                        {
+                            ctx.extensions
+                                .get_or_insert_with(ResponsesState::default)
+                                .provider_streamed_terminal_ids
+                                .insert(id.to_owned());
+                        }
+                        for k in &keys {
+                            state.local_tool_items.remove(k);
+                        }
+                    }
+                    // Opening + progress fall through and pass normally.
+                },
+            }
+        }
+    }
+
     if event.is_terminal() {
         let event_type = event.event_type().to_owned();
         state.deferred_terminal = Some(DeferredTerminalEvent {
@@ -449,14 +627,7 @@ fn append_logical_event(
         });
         return;
     }
-    if state.iteration > 0
-        && matches!(
-            event,
-            ResponsesEvent::ResponseCreated(_)
-                | ResponsesEvent::ResponseQueued(_)
-                | ResponsesEvent::ResponseInProgress(_)
-        )
-    {
+    if state.iteration > 0 && is_response_lifecycle_creation(&event) {
         return;
     }
 
@@ -490,7 +661,7 @@ fn commit_local_tool_milestones(
     // via `emitted_output_items`, this is what a resumed round's flush consults.
     record_model_output_item(ctx, event);
 
-    // #276: ahead of the first resumed model output event, stream any locally
+    // #276: ahead of the first model output *content* event, stream any locally
     // generated tool items (MCP calls/approvals, or web searches absent from the
     // upstream stream) that the tool-dispatch filters appended to
     // `accumulated_output` but never emitted incrementally. They must precede the
@@ -498,7 +669,18 @@ fn commit_local_tool_milestones(
     // `accumulated_output` is fixed for the round, so the flush runs once here
     // rather than re-serializing every local item ahead of each event; the EOS
     // flush still catches items whose round produced no resumed model event.
-    if state.iteration > 0 && !state.local_items_flushed {
+    //
+    // The flush is deferred past `response.created`/`queued`/`in_progress` rather
+    // than gated on `iteration > 0`: an MCP approval resume (#1029) executes the
+    // approved tool during `on_request_body`, before any inference round, so its
+    // local `mcp_call` sits at `accumulated_output[0]` while `iteration` is still 0
+    // and the round still forwards its own lifecycle-creation events. Gating on the
+    // round number left that index-0 item unannounced ahead of the model output
+    // shifted to index 1, tripping client stream accumulators. At `iteration > 0`
+    // the creation events never reach here (suppressed above), so the first event
+    // seen is already content and the behavior is unchanged. When no local item is
+    // pending — the common first round — `flush_local_output_items` is a no-op.
+    if !state.local_items_flushed && !is_response_lifecycle_creation(event) {
         flush_local_output_items(ctx, output);
         state.local_items_flushed = true;
     }
@@ -619,20 +801,45 @@ fn is_premature_local_tool_done(ctx: &HttpFilterContext<'_>, event: &ResponsesEv
 }
 
 /// Whether an event type is a tool-specific progress or outcome event the model
-/// backend streams in-band for a hosted `web_search_call` or `mcp_call`
-/// (`response.web_search_call.*` / `response.mcp_call.*`). Observing one proves
-/// the progress lifecycle reached the client, so the proxy must not synthesize
-/// it again.
+/// backend streams in-band for a hosted `web_search_call`, `mcp_call`, or
+/// `mcp_list_tools` (`response.web_search_call.*` / `response.mcp_call.*` /
+/// `response.mcp_list_tools.*`). Observing one proves the progress lifecycle
+/// reached the client, so the proxy must not synthesize it again.
+///
+/// `mcp_list_tools` is included because a *deferred* MCP entry (`defer_loading:
+/// true`, or one lacking a `server_url`) is passed through unresolved by
+/// `openai_mcp_tool_resolve`, so the backend performs `tools/list` itself and
+/// natively streams the discovery lifecycle. Recording those phases keeps a
+/// backend-executed listing's real `output_item.done` from being suppressed as
+/// premature (issue #1022), exactly as native `web_search_call`/`mcp_call`
+/// passthrough is already handled. A locally seeded listing streams no such
+/// events, so this predicate is inert for it and its lifecycle is synthesized by
+/// [`flush_local_output_items`] as before.
 fn is_local_tool_progress_event(event_type: &str) -> bool {
-    event_type.starts_with("response.web_search_call.") || event_type.starts_with("response.mcp_call.")
+    event_type.starts_with("response.web_search_call.")
+        || event_type.starts_with("response.mcp_call.")
+        || event_type.starts_with("response.mcp_list_tools.")
 }
 
-/// Whether an accumulated output item was generated locally by a tool-dispatch
-/// filter rather than streamed by the model backend.
+/// Whether an output item is one of the tool types whose streaming lifecycle the
+/// proxy reconciles — whether locally synthesized (seeded by a tool-dispatch
+/// filter) or streamed natively by the model backend.
+///
+/// `mcp_list_tools` is such a type. On eager resolution `openai_mcp_tool_resolve`
+/// runs the MCP `tools/list` and seeds the discovery listing into
+/// `accumulated_output` before any inference round (issue #1022), so the backend —
+/// which then only sees the rewritten `type: "function"` tools — never streams it.
+/// But a *deferred* entry (`defer_loading: true`, or one lacking a `server_url`) is
+/// passed through unresolved, so the backend performs `tools/list` itself and
+/// natively streams the listing. Both are recognized here; whether a given
+/// lifecycle event is synthesized or forwarded is then decided by the phases
+/// actually streamed in-band ([`is_local_tool_progress_event`] →
+/// `streamed_phases`) and by provenance (`locally_executed_output_items`, which
+/// gates [`collect_pending_local_items`]), not by this type check alone.
 fn is_local_tool_item(item: &Value) -> bool {
     matches!(
         item.get("type").and_then(Value::as_str),
-        Some("mcp_call" | "mcp_approval_request" | "web_search_call")
+        Some("mcp_call" | "mcp_approval_request" | "web_search_call" | "mcp_list_tools")
     )
 }
 
@@ -1006,11 +1213,21 @@ fn item_lifecycle_payload(event_type: &str, output_index: u64, item: Value) -> V
 /// The full ordered tool-specific lifecycle a local item owes the client between
 /// `output_item.added` and `output_item.done`, per issue #276.
 ///
-/// `mcp_call` progresses `in_progress` then `completed`/`failed`;
-/// `web_search_call` progresses `in_progress`, `searching`, then `completed` only
-/// when it actually completed (web search has no conformant `failed` event, so
-/// other outcomes surface through `output_item.done` alone). `mcp_approval_request`
-/// has no dedicated progress events; it surfaces through
+/// `mcp_call` progresses `in_progress` then `completed`/`failed`, selected by
+/// whether the item carries a non-null `error`. `web_search_call` progresses
+/// `in_progress`, `searching`, then `completed` only when it actually completed
+/// (web search has no conformant `failed` event, so other outcomes surface
+/// through `output_item.done` alone). `mcp_list_tools` progresses `in_progress`
+/// then `completed`/`failed`, selected the same way as `mcp_call`: a locally
+/// seeded listing is created only on successful discovery (issue #1022) so its
+/// terminal phase is `completed`, but a *deferred* entry the backend resolves
+/// natively can also fail its `tools/list`, streaming `mcp_list_tools.failed` on
+/// an item carrying an `error` — matching the expected terminal phase to that
+/// error keeps the backend's real `output_item.done` from being dropped as
+/// premature (issue #1022). A *local* discovery failure instead takes the
+/// separate `response.mcp_list_tools.failed` terminal-SSE path in
+/// `openai_mcp_tool_resolve` (issue #320) and never reaches this synthesis.
+/// `mcp_approval_request` has no dedicated progress events; it surfaces through
 /// `output_item.added`/`output_item.done` alone.
 ///
 /// These are distinct API lifecycle events, not one combined milestone. Callers
@@ -1018,6 +1235,14 @@ fn item_lifecycle_payload(event_type: &str, output_index: u64, item: Value) -> V
 /// lifecycle still gets exactly its missing events synthesized.
 fn expected_phase_events(item: &Value) -> Vec<&'static str> {
     match item.get("type").and_then(Value::as_str) {
+        Some("mcp_list_tools") => {
+            let outcome = if item.get("error").is_some_and(|error| !error.is_null()) {
+                "response.mcp_list_tools.failed"
+            } else {
+                "response.mcp_list_tools.completed"
+            };
+            vec!["response.mcp_list_tools.in_progress", outcome]
+        },
         Some("mcp_call") => {
             let outcome = if item.get("error").is_some_and(|error| !error.is_null()) {
                 "response.mcp_call.failed"
@@ -1122,9 +1347,18 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     let parser_deferred_done = ctx
         .get_filter_state::<StreamEventsState>()
         .is_some_and(|state| state.deferred_done);
+    let mut output = prepare_local_terminal_events(ctx);
     let state = ctx.extensions.get_mut::<ResponsesState>()?;
     let deferred_done = state.deferred_stream_done || parser_deferred_done;
-    canonicalize_logical_response(state);
+    if !state.response_object.is_object() {
+        state.response_object = std::mem::take(&mut state.local_completion_response_template);
+    }
+    // A local completion synthesizes both the wire terminal (below) and the store
+    // source from this same `response_object`, so they cannot diverge; restore the
+    // caller id on any rehydrated turn — there is no separate upstream wire whose
+    // narrower eligibility to match.
+    let restore_previous_response_id = state.history_rehydrated;
+    canonicalize_logical_response(state, restore_previous_response_id);
     if !state.response_object.is_object() {
         return None;
     }
@@ -1132,7 +1366,7 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     let sequence_number = state.logical_stream_sequence;
     state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
 
-    let mut output = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":".to_vec();
+    output.extend_from_slice(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":");
     serde_json::to_writer(&mut output, &state.response_object).ok()?;
     output.extend_from_slice(b",\"sequence_number\":");
     serde_json::to_writer(&mut output, &sequence_number).ok()?;
@@ -1143,18 +1377,100 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     Some(Bytes::from(output))
 }
 
+/// Encode a terminal `error` event for an already-committed logical stream.
+///
+/// The dispatch owner (`openai_agentic_loop`) calls this during request-body
+/// EOS when a request-phase dispatcher recorded a
+/// [`DispatchFailure`](crate::openai::responses::state::DispatchFailure) after
+/// the stream was already committed. It mirrors [`encode_local_completion`]: the
+/// terminal frame is built directly from shared response state so IRR can append
+/// it after the logical stream chunks already emitted this round, rather than
+/// through the response-body finalizer (no upstream response body exists on a
+/// dispatch failure).
+///
+/// A terminal `error` frame is never followed by a `[DONE]` sentinel — the SSE
+/// error event is itself the stream terminator, matching the response-body
+/// finalizer's own error branch, which emits the error and stops.
+pub(crate) fn encode_local_error(ctx: &mut HttpFilterContext<'_>, code: &str, message: &str) -> Option<Bytes> {
+    let mut output = prepare_local_terminal_events(ctx);
+    let state = ctx.extensions.get_mut::<ResponsesState>()?;
+    let sequence_number = state.logical_stream_sequence;
+    state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
+
+    let mut payload = responses_error_sse_payload(code, message);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("sequence_number".to_owned(), Value::from(sequence_number));
+    }
+    encode_sse_event("error", &payload, &mut output);
+    Some(Bytes::from(output))
+}
+
+/// Emit locally executed tool lifecycles before a request-phase terminal frame.
+///
+/// Request-phase completion and dispatch failure have no later upstream
+/// response, so the normal response-body finalizer cannot drain pending
+/// synthesis or flush locally generated output items for them.
+fn prepare_local_terminal_events(ctx: &mut HttpFilterContext<'_>) -> Vec<u8> {
+    let mut output = Vec::new();
+    local_tools::drain_local_tool_synthesis(ctx, &mut output);
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.provider_streamed_terminal_ids.clear();
+    }
+    flush_local_output_items(ctx, &mut output);
+    output
+}
+
 /// Emit the held terminal event only when the current IRR step is terminal.
 fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
     let Some(mut parser_state) = ctx.remove_filter_state::<StreamEventsState>() else {
         return;
     };
-    if !parser_state.logical_stream {
-        ctx.insert_filter_state(parser_state);
-        return;
-    }
 
-    let continues = logical_stream_continues(ctx);
-    let mut output = Vec::new();
+    // Preserve any non-terminal logical events `process_chunk` already emitted
+    // for this final chunk, then append synthesized local-tool events and the
+    // deferred terminal. A transport that reassembles the whole stream before
+    // releasing it (e.g. `responses_to_chat_completions`) delivers the
+    // created/delta events and deferred terminal together in the end-of-stream
+    // chunk; starting from an empty buffer here would drop those earlier events.
+    let mut output = body.take().map_or_else(Vec::new, |bytes| bytes.to_vec());
+    // #1046 §4.2: drain file_search synthesis before terminal/error finalization,
+    // under the precedence policy. The owner queues each reconciled call by its
+    // absolute output index this round, but the request-phase dispatcher only
+    // reconciles it at the NEXT re-entry's request-body EOS; drain therefore defers
+    // still-pending items and synthesizes them at the finalize that follows their
+    // reconciliation. A validation failure here calls fs_end_stream_with_error_ctx
+    // (site (b), §7.3) so the error branch below is selected and the router does not
+    // re-fire.
+    local_tools::drain_local_tool_synthesis(ctx, &mut output);
+    // #313 P1 (DoS bound): this round's provider-streamed observation set is stale
+    // once the round that recorded it finalizes; clear it unconditionally here — NOT
+    // inside drain_local_tool_synthesis, which early-returns on an empty synthesis
+    // queue (exactly the all-natives-streamed-live case) — so it cannot accumulate
+    // across IRR continuation rounds and bypass the max_state_bytes ceiling. The ids
+    // are stale after the round that recorded them, so clearing loses nothing.
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.provider_streamed_terminal_ids.clear();
+    }
+    // #1046 P1: a terminal failure recorded after the owner already published its
+    // per-round continuation — our own parse/validation error (`stream_error_code`, e.g.
+    // set by validate_stream_end at EOS, which runs AFTER the owner records assignments)
+    // or a flat upstream `error` completion (`stream_completion == "error"`, which sets no
+    // error code) — must clear a stale owner `action="loop"` to the two-key stop, or the
+    // error frame is suppressed and another IRR round fires. Scoped to the owner: it is
+    // the single continuation authority, and clearing it also covers the oversized
+    // web_search batch case (the owner sets loop before web_search caps the batch).
+    let owner_looping = ctx
+        .filter_results
+        .get("openai_agentic_loop")
+        .and_then(|results| results.get("action"))
+        == Some("loop");
+    let terminal_error = ctx.get_metadata("responses.stream_error_code").is_some()
+        || ctx.get_metadata("responses.stream_completion") == Some("error");
+    if owner_looping && terminal_error {
+        crate::openai::responses::fs_arm_stream_stop(ctx);
+    }
+    let continues = logical_stream_continues(ctx); // re-read AFTER drain + arm-stop: a
+    // (b)-site failure or the arm-stop above flips the owner action=done.
     if !continues && let Some(mut error) = logical_stream_error(ctx) {
         // #276: surface any locally executed tool items that never reached the
         // client before the stream terminates with an error, so already-executed
@@ -1182,7 +1498,11 @@ fn emit_deferred_terminal(
     // loop without a resumed round) before the terminal snapshot.
     flush_local_output_items(ctx, output);
     let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
-    let (accumulated_output, usage) = canonicalize_logical_response(state);
+    // The upstream event stream is the client-visible terminal, rewritten (or left
+    // untouched) by `openai_responses_rehydrate`; match its wire-rewrite decision so
+    // the persisted store source cannot disagree with the streamed frame (#1150).
+    let restore_previous_response_id = state.previous_response_id_stream_restore_armed;
+    let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id);
     if let Some(response) = terminal.payload.get_mut("response").and_then(Value::as_object_mut) {
         response.insert("output".to_owned(), Value::Array(accumulated_output));
         if !usage.is_null() {
@@ -1196,11 +1516,18 @@ fn emit_deferred_terminal(
     }
 }
 
-/// Whether a dispatch filter requested another inference step.
+/// Whether the agentic-loop owner requested another inference step.
+///
+/// After the #1046 unification the owner (`openai_agentic_loop`) is the single
+/// authority that decides whether the logical stream continues: its
+/// `has_dispatchable_calls` signal is a strict superset of every dispatcher's
+/// per-round work (`web_search` calls, `file_search` assignments, MCP-classified
+/// tool calls), so keying on the owner alone covers all three dispatchers.
 fn logical_stream_continues(ctx: &HttpFilterContext<'_>) -> bool {
-    ["openai_mcp_dispatch", "openai_web_search"]
-        .iter()
-        .any(|filter| ctx.filter_results.get(filter).and_then(|results| results.get("action")) == Some("loop"))
+    ctx.filter_results
+        .get("openai_agentic_loop")
+        .and_then(|results| results.get("action"))
+        == Some("loop")
 }
 
 /// Return a locally generated terminal error for an already-committed stream.
@@ -1211,20 +1538,65 @@ fn logical_stream_error(ctx: &HttpFilterContext<'_>) -> Option<Value> {
 }
 
 /// Make the response-store source agree with the logical SSE terminal.
-fn canonicalize_logical_response(state: &mut ResponsesState) -> (Vec<Value>, Value) {
+///
+/// `restore_previous_response_id` decides whether to repair the id the backend
+/// echoed as `null` after a rehydrated turn stripped it from the upstream request
+/// (#1150). It MUST mirror whichever path owns the client-visible terminal, or a
+/// later GET disagrees with what the client streamed:
+/// - upstream streaming: the wire is rewritten by `openai_responses_rehydrate`, so the caller passes
+///   `state.previous_response_id_stream_restore_armed` — the filter's own `eligible_previous_response_id_stream`
+///   decision, which declines validator-bearing and non-200 streams the store must therefore also leave alone (issue
+///   #1150 review);
+/// - local completion: this function's output *is* the wire terminal, so the two cannot diverge and the caller restores
+///   on `history_rehydrated` alone.
+///
+/// Either way the id is only ever restored, never fabricated: a non-rehydrated
+/// turn keeps the real value the backend echoed.
+fn canonicalize_logical_response(
+    state: &mut ResponsesState,
+    restore_previous_response_id: bool,
+) -> (Vec<Value>, Value) {
     let logical_id = state.logical_stream_response_id.clone();
-    let accumulated_output = state.accumulated_output.clone();
     let usage = state.usage.clone();
+    let restored_previous_response_id = restore_previous_response_id
+        .then(|| state.previous_response_id.clone())
+        .flatten();
+    // Prefer the cross-round accumulator populated by dispatch/loop filters
+    // (agentic pipelines). When no such filter ran — a plain one-round logical
+    // stream — it stays empty, so fall back to the terminal event's own output
+    // rather than clobber it with nothing. Mirrors `finalize_response_body`.
+    let mut output = if state.accumulated_output.is_empty() {
+        state.output_items().to_vec()
+    } else {
+        state.accumulated_output.clone()
+    };
+    // Rewrite file_search citation markers into typed annotations on the final
+    // assistant message, mirroring the buffered `annotate_response` finalize
+    // path. In streaming the dispatcher reconciled `citation_files` during a
+    // prior request-phase round, but the model's citing answer only arrives in
+    // the terminal round — so this is the single point where both are present.
+    // No-op when no dispatcher recorded citation files. Best-effort: the logical
+    // stream is already committed here, so a malformed marker degrades to
+    // un-annotated text rather than aborting the terminal.
+    if let Err(error) = crate::openai::responses::file_search_callout::citations::annotate_output_items(
+        &mut output,
+        &state.citation_files,
+    ) {
+        tracing::warn!(%error, "failed to annotate logical stream response citations");
+    }
     if let Some(response) = state.response_object.as_object_mut() {
         if let Some(logical_id) = logical_id {
             response.insert("id".to_owned(), Value::String(logical_id));
         }
-        response.insert("output".to_owned(), Value::Array(accumulated_output.clone()));
+        if let Some(prev_id) = restored_previous_response_id {
+            response.insert("previous_response_id".to_owned(), Value::String(prev_id));
+        }
+        response.insert("output".to_owned(), Value::Array(output.clone()));
         if !usage.is_null() {
             response.insert("usage".to_owned(), usage.clone());
         }
     }
-    (accumulated_output, usage)
+    (output, usage)
 }
 
 /// Check whether the stream has exceeded its wall-clock timeout.
@@ -1276,21 +1648,21 @@ fn mark_complete(state: &mut StreamEventsState, new_state: CompletionState, now:
 
 /// Check that the SSE stream terminated with a terminal event.
 fn validate_stream_end(ctx: &mut HttpFilterContext<'_>) {
-    let incomplete_logical_stream = ctx.get_filter_state::<StreamEventsState>().and_then(|state| {
+    let incomplete = ctx.get_filter_state::<StreamEventsState>().is_some_and(|state| {
         let checked_at = state.completed_at.unwrap_or_else(Instant::now);
         if let Err(e) = check_timeout(state, checked_at) {
             warn!(error = %e, "stream did not terminate cleanly");
-            Some(state.logical_stream)
+            true
         } else if state.completion_state == CompletionState::Open {
             warn!("stream did not terminate cleanly: missing terminal event");
-            Some(state.logical_stream)
+            true
         } else {
-            None
+            false
         }
     });
-    if let Some(logical_stream) = incomplete_logical_stream {
+    if incomplete {
         ctx.set_metadata("responses.stream_incomplete", "true".to_owned());
-        if logical_stream && ctx.get_metadata("responses.stream_error_code").is_none() {
+        if ctx.get_metadata("responses.stream_error_code").is_none() {
             ctx.set_metadata("responses.stream_error_code", "server_error");
             ctx.set_metadata(
                 "responses.stream_error_message",

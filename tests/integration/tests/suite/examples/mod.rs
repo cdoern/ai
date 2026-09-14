@@ -20,12 +20,13 @@ mod credential_injection;
 mod external_metering;
 mod file_search_callout;
 mod file_search_chat_completions;
-mod full_flow;
+mod file_search_streaming;
 mod full_flow_agentic;
 #[cfg(feature = "gcp-adc-filter")]
 mod gcp_adc;
 mod guardrails;
 mod guardrails_response;
+mod identity_header_guard;
 mod inference_fallback;
 mod irr_terminal_streaming;
 #[cfg(feature = "http-callout-filter")]

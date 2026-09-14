@@ -2882,6 +2882,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "sse-stream",
  "tempfile",
@@ -3191,6 +3192,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "yaml_serde",
 ]
 
 [[package]]

@@ -11,15 +11,13 @@ use super::*;
 use crate::{
     openai::sse::{SseFrame, SseFrameParser},
     store::{
-        ConversationRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
+        ConversationRecord, PendingApprovalRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry,
+        SqliteResponseStore, StoreError,
     },
 };
 
 fn default_filter() -> RehydrateFilter {
-    RehydrateFilter {
-        max_history_bytes: default_max_history_bytes(),
-        max_history_items: None,
-    }
+    RehydrateFilter
 }
 
 // -----------------------------------------------------------------------------
@@ -221,6 +219,89 @@ async fn validates_previous_response_and_sets_metadata() {
         "current input should be last"
     );
     assert_eq!(state.response_id.as_deref(), Some("resp_current"));
+}
+
+// -----------------------------------------------------------------------------
+// Request-phase marker preservation across state rehydration
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn store_persist_armed_survives_rehydrate_from_previous_response() {
+    let messages = json!([
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi there"}
+    ]);
+    let store = MockStore::with_completed_response("resp_prev", json!("Hello"), messages);
+    let registry = setup_registry(store);
+
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    // The store filter arms persistence earlier in the request phase; rehydrate
+    // replaces ResponsesState and must not drop that exchange-scoped marker, or a
+    // continuation-turn approval would be falsely rejected as unresumable.
+    ctx.extensions.insert(ResponsesState {
+        store_persist_armed: true,
+        ..Default::default()
+    });
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_prev"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "should release after validation"
+    );
+
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("ResponsesState should be populated");
+    assert!(
+        state.store_persist_armed,
+        "rehydrate must preserve the store filter's persistence-armed marker"
+    );
+}
+
+#[tokio::test]
+async fn store_persist_armed_survives_rehydrate_from_conversation() {
+    let messages = json!([
+        {"role": "user", "content": "turn one"},
+        {"role": "assistant", "content": "reply one"}
+    ]);
+    let store = MockStore::with_conversation("conv_abc", messages);
+    let registry = setup_registry(store);
+
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.extensions.insert(ResponsesState {
+        store_persist_armed: true,
+        ..Default::default()
+    });
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"turn two","conversation":"conv_abc"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "should release after conversation rehydration"
+    );
+
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("ResponsesState should be populated from conversation");
+    assert!(
+        state.store_persist_armed,
+        "conversation rehydrate must also preserve the persistence-armed marker"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1072,106 +1153,49 @@ fn replay_canonicalizes_defaulted_item_types_and_excludes_unknown_items() {
     );
 }
 
-// -----------------------------------------------------------------------------
-// History Limits
-// -----------------------------------------------------------------------------
+// History limits (max_history_bytes, max_history_items) have been removed.
+// The OpenAI API does not define a total conversation item or byte ceiling;
+// model context overflow is governed by the Responses API `truncation`
+// setting. The fields are no longer accepted at all: configs that still set
+// them fail to build via deny_unknown_fields. See #532.
 
-#[tokio::test]
-async fn rejects_stored_history_exceeding_byte_limit() {
-    let user_content = "A".repeat(500);
-    let assistant_content = "B".repeat(500);
-    let messages = json!([
-        {"role": "user", "content": user_content},
-        {"role": "assistant", "content": assistant_content}
-    ]);
-    let store = MockStore::with_completed_response("resp_big", json!("Hello"), messages);
-    let registry = setup_registry(store);
-
-    let filter = RehydrateFilter {
-        max_history_bytes: 64,
-        max_history_items: None,
-    };
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_big"}"#));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    match action {
-        FilterAction::Reject(r) => {
-            assert_eq!(r.status, 413, "should reject with 413 for oversized history");
-            let body_bytes = r.body.unwrap();
-            let body_str = std::str::from_utf8(&body_bytes).unwrap();
-            assert!(
-                body_str.contains("byte limit"),
-                "rejection body should mention byte limit: {body_str}"
-            );
-        },
-        other => panic!("expected Reject, got {other:?}"),
+#[test]
+fn removed_history_limit_fields_rejected() {
+    for field in ["max_history_bytes: 1048576", "max_history_items: 200"] {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(field).unwrap();
+        let result = RehydrateFilter::from_config(&yaml);
+        assert!(
+            result.is_err(),
+            "removed history-limit field should be rejected by deny_unknown_fields: {field}"
+        );
     }
 }
 
 #[tokio::test]
-async fn rejects_stored_history_exceeding_item_limit() {
-    let messages = json!([
-        {"role": "user", "content": "Turn 1"},
-        {"role": "assistant", "content": "Reply 1"},
-        {"role": "user", "content": "Turn 2"},
-        {"role": "assistant", "content": "Reply 2"},
-        {"role": "user", "content": "Turn 3"}
-    ]);
-    let store = MockStore::with_completed_response("resp_many", json!("Hello"), messages);
+async fn large_history_accepted_without_rejection() {
+    let items: Vec<Value> = (0..500)
+        .map(|i| {
+            if i % 2 == 0 {
+                json!({"role": "user", "content": format!("message {i} {}", "x".repeat(200))})
+            } else {
+                json!({"role": "assistant", "content": format!("reply {i} {}", "y".repeat(200))})
+            }
+        })
+        .collect();
+    let store = MockStore::with_completed_response("resp_big", json!("Hello"), Value::Array(items));
     let registry = setup_registry(store);
 
-    let filter = RehydrateFilter {
-        max_history_bytes: default_max_history_bytes(),
-        max_history_items: Some(3),
-    };
+    let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_many"}"#));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    match action {
-        FilterAction::Reject(r) => {
-            assert_eq!(r.status, 413, "should reject with 413 for too many items");
-            let body_bytes = r.body.unwrap();
-            let body_str = std::str::from_utf8(&body_bytes).unwrap();
-            assert!(
-                body_str.contains("item limit"),
-                "rejection body should mention item limit: {body_str}"
-            );
-        },
-        other => panic!("expected Reject, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn allows_history_within_limits() {
-    let messages = json!([
-        {"role": "user", "content": "Hello"},
-        {"role": "assistant", "content": "Hi"}
-    ]);
-    let store = MockStore::with_completed_response("resp_ok", json!("Hello"), messages);
-    let registry = setup_registry(store);
-
-    let filter = RehydrateFilter {
-        max_history_bytes: default_max_history_bytes(),
-        max_history_items: Some(10),
-    };
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    let mut body = Some(Bytes::from(r#"{"input":"Next","previous_response_id":"resp_ok"}"#));
+    let mut body = Some(Bytes::from(r#"{"input":"next","previous_response_id":"resp_big"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(
         matches!(action, FilterAction::Release),
-        "should release when history is within limits"
+        "large history should be accepted without limit enforcement"
     );
 
     let state = ctx
@@ -1179,163 +1203,46 @@ async fn allows_history_within_limits() {
         .get::<ResponsesState>()
         .expect("ResponsesState should be populated");
     assert_eq!(
-        state.messages.len(),
-        3,
-        "messages should contain 2 stored + 1 current input"
+        state.persisted_messages.len(),
+        501,
+        "all 500 stored items plus current input should be preserved"
     );
 }
 
 #[tokio::test]
-async fn from_config_with_custom_limits() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str("max_history_bytes: 2097152\nmax_history_items: 2").unwrap();
-    let filter = RehydrateFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.name(), "openai_responses_rehydrate");
-
+async fn truncation_setting_preserved_through_rehydration() {
     let messages = json!([
-        {"role": "user", "content": "hello"},
-        {"role": "assistant", "content": "hi"},
-        {"role": "user", "content": "third"}
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi"}
     ]);
-    let store = MockStore::with_completed_response("resp_cfg", json!("hello"), messages);
+    let store = MockStore::with_completed_response("resp_trunc", json!("Hello"), messages);
     let registry = setup_registry(store);
 
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.extensions.insert(registry);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    let mut body = Some(Bytes::from(r#"{"input":"next","previous_response_id":"resp_cfg"}"#));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    match action {
-        FilterAction::Reject(r) => {
-            assert_eq!(r.status, 413, "configured item limit of 2 should reject 3-item history");
-        },
-        other => panic!("expected Reject for custom max_history_items=2, got {other:?}"),
-    }
-}
-
-#[test]
-fn from_config_rejects_zero_limits() {
-    let yaml = serde_yaml::from_str::<serde_yaml::Value>("max_history_bytes: 0").unwrap();
-    assert!(RehydrateFilter::from_config(&yaml).is_err());
-
-    let yaml = serde_yaml::from_str::<serde_yaml::Value>("max_history_items: 0").unwrap();
-    assert!(RehydrateFilter::from_config(&yaml).is_err());
-}
-
-#[tokio::test]
-async fn rejects_fallback_reconstruction_exceeding_byte_limit() {
-    let large_input = "X".repeat(500);
-    let large_output = json!([
-        {"type": "message", "content": [{"type": "output_text", "text": "Y".repeat(500)}]}
-    ]);
-    let mut records = std::collections::HashMap::new();
-    records.insert(
-        "resp_fallback".to_owned(),
-        ResponseRecord {
-            id: "resp_fallback".to_owned(),
-            tenant_id: "default".to_owned(),
-            created_at: 1000,
-            model: "gpt-4.1".to_owned(),
-            response_object: json!({
-                "id": "resp_fallback",
-                "status": "completed",
-                "output": large_output,
-            }),
-            input: json!(large_input),
-            messages: json!([]),
-        },
-    );
-    let store = MockStore {
-        records,
-        conversations: std::collections::HashMap::new(),
-        should_fail: false,
-    };
-    let registry = setup_registry(store);
-
-    let filter = RehydrateFilter {
-        max_history_bytes: 64,
-        max_history_items: None,
-    };
+    let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(registry.clone());
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_fallback"}"#));
+    let mut body = Some(Bytes::from(
+        r#"{"input":"next","previous_response_id":"resp_trunc","truncation":"auto"}"#,
+    ));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    match action {
-        FilterAction::Reject(r) => {
-            assert_eq!(
-                r.status, 413,
-                "fallback reconstruction exceeding byte limit should reject with 413"
-            );
-        },
-        other => panic!("expected Reject for oversized fallback reconstruction, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn rejects_fallback_reconstruction_exceeding_item_limit() {
-    let input = json!([
-        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "a"}]},
-        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "b"}]},
-        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "c"}]}
-    ]);
-    let output = json!([
-        {"type": "message", "content": [{"type": "output_text", "text": "r1"}]},
-        {"type": "message", "content": [{"type": "output_text", "text": "r2"}]}
-    ]);
-    let mut records = std::collections::HashMap::new();
-    records.insert(
-        "resp_items".to_owned(),
-        ResponseRecord {
-            id: "resp_items".to_owned(),
-            tenant_id: "default".to_owned(),
-            created_at: 1000,
-            model: "gpt-4.1".to_owned(),
-            response_object: json!({
-                "id": "resp_items",
-                "status": "completed",
-                "output": output,
-            }),
-            input,
-            messages: json!([]),
-        },
+    assert!(
+        matches!(action, FilterAction::Release),
+        "should release with truncation"
     );
-    let store = MockStore {
-        records,
-        conversations: std::collections::HashMap::new(),
-        should_fail: false,
-    };
-    let registry = setup_registry(store);
 
-    let filter = RehydrateFilter {
-        max_history_bytes: default_max_history_bytes(),
-        max_history_items: Some(3),
-    };
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    let mut body = Some(Bytes::from(r#"{"input":"Hi","previous_response_id":"resp_items"}"#));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    match action {
-        FilterAction::Reject(r) => {
-            assert_eq!(
-                r.status, 413,
-                "fallback reconstruction exceeding item limit should reject with 413"
-            );
-            let body_bytes = r.body.unwrap();
-            let body_str = std::str::from_utf8(&body_bytes).unwrap();
-            assert!(
-                body_str.contains("item limit"),
-                "rejection body should mention item limit: {body_str}"
-            );
-        },
-        other => panic!("expected Reject for oversized fallback reconstruction, got {other:?}"),
-    }
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .expect("ResponsesState should be populated");
+    assert!(state.history_rehydrated, "history should be marked as rehydrated");
+    assert_eq!(
+        body.as_ref().unwrap().as_ref(),
+        r#"{"input":"next","previous_response_id":"resp_trunc","truncation":"auto"}"#.as_bytes(),
+        "request body with truncation should not be modified"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -1425,58 +1332,6 @@ async fn rehydrates_from_conversation_object_form() {
     assert_eq!(
         state.messages[2]["content"], "follow up",
         "current input should be last"
-    );
-}
-
-#[tokio::test]
-async fn previous_response_id_takes_precedence_over_conversation() {
-    let response_messages = json!([
-        {"role": "user", "content": "from response"},
-        {"role": "assistant", "content": "response reply"}
-    ]);
-    let mut store = MockStore::with_completed_response("resp_win", json!("from response"), response_messages);
-    store.conversations.insert(
-        "conv_lose".to_owned(),
-        ConversationRecord {
-            conversation_id: "conv_lose".to_owned(),
-            tenant_id: "default".to_owned(),
-            created_at: 1000,
-            metadata: json!({}),
-            messages: json!([
-                {"role": "user", "content": "from conversation"},
-                {"role": "assistant", "content": "conversation reply"}
-            ]),
-        },
-    );
-    let registry = setup_registry(store);
-
-    let filter = default_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    let mut body = Some(Bytes::from(
-        r#"{"model":"gpt-4.1","input":"next","previous_response_id":"resp_win","conversation":"conv_lose"}"#,
-    ));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Release),
-        "should release after rehydration"
-    );
-
-    let state = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .expect("ResponsesState should be populated");
-    assert_eq!(
-        state.messages[0]["content"], "from response",
-        "previous_response_id should take precedence over conversation"
-    );
-    assert_eq!(
-        ctx.get_metadata("responses.previous_response_id"),
-        Some("resp_win"),
-        "previous_response_id metadata should be set"
     );
 }
 
@@ -1649,127 +1504,6 @@ async fn conversation_null_messages_treated_as_empty() {
     );
 }
 
-// -----------------------------------------------------------------------------
-// Conversation History Limits
-// -----------------------------------------------------------------------------
-
-#[tokio::test]
-async fn rejects_conversation_history_exceeding_byte_limit() {
-    let user_content = "A".repeat(500);
-    let assistant_content = "B".repeat(500);
-    let messages = json!([
-        {"role": "user", "content": user_content},
-        {"role": "assistant", "content": assistant_content}
-    ]);
-    let store = MockStore::with_conversation("conv_big", messages);
-    let registry = setup_registry(store);
-
-    let filter = RehydrateFilter {
-        max_history_bytes: 64,
-        max_history_items: None,
-    };
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    let mut body = Some(Bytes::from(
-        r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_big"}"#,
-    ));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    match action {
-        FilterAction::Reject(r) => {
-            assert_eq!(
-                r.status, 413,
-                "should reject with 413 for oversized conversation history"
-            );
-            let body_bytes = r.body.unwrap();
-            let body_str = std::str::from_utf8(&body_bytes).unwrap();
-            assert!(
-                body_str.contains("byte limit"),
-                "rejection body should mention byte limit: {body_str}"
-            );
-        },
-        other => panic!("expected Reject, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn rejects_conversation_history_exceeding_item_limit() {
-    let messages = json!([
-        {"role": "user", "content": "Turn 1"},
-        {"role": "assistant", "content": "Reply 1"},
-        {"role": "user", "content": "Turn 2"},
-        {"role": "assistant", "content": "Reply 2"},
-        {"role": "user", "content": "Turn 3"}
-    ]);
-    let store = MockStore::with_conversation("conv_many", messages);
-    let registry = setup_registry(store);
-
-    let filter = RehydrateFilter {
-        max_history_bytes: default_max_history_bytes(),
-        max_history_items: Some(3),
-    };
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    let mut body = Some(Bytes::from(
-        r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_many"}"#,
-    ));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    match action {
-        FilterAction::Reject(r) => {
-            assert_eq!(r.status, 413, "should reject with 413 for too many conversation items");
-            let body_bytes = r.body.unwrap();
-            let body_str = std::str::from_utf8(&body_bytes).unwrap();
-            assert!(
-                body_str.contains("item limit"),
-                "rejection body should mention item limit: {body_str}"
-            );
-        },
-        other => panic!("expected Reject, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn allows_conversation_history_within_limits() {
-    let messages = json!([
-        {"role": "user", "content": "Hello"},
-        {"role": "assistant", "content": "Hi"}
-    ]);
-    let store = MockStore::with_conversation("conv_ok", messages);
-    let registry = setup_registry(store);
-
-    let filter = RehydrateFilter {
-        max_history_bytes: default_max_history_bytes(),
-        max_history_items: Some(10),
-    };
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    let mut body = Some(Bytes::from(
-        r#"{"model":"gpt-4.1","input":"Next","conversation":"conv_ok"}"#,
-    ));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Release),
-        "should release when conversation history is within limits"
-    );
-
-    let state = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .expect("ResponsesState should be populated");
-    assert_eq!(
-        state.messages.len(),
-        3,
-        "messages should contain 2 stored + 1 current input"
-    );
-}
 
 // -----------------------------------------------------------------------------
 // Response-side previous_response_id restore (issue #932)
@@ -1988,6 +1722,15 @@ async fn restores_for_streaming_response() {
     assert!(
         matches!(action, FilterAction::Continue),
         "on_response should continue and arm the streaming restore"
+    );
+    // #1150: an eligible stream also arms the persistence-source restore so
+    // `canonicalize_logical_response` repairs the stored `response_object` to match
+    // these rewritten wire frames.
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.previous_response_id_stream_restore_armed),
+        "an eligible streaming restore must arm the store-source restore flag"
     );
 
     let input = concat!(
@@ -2212,6 +1955,15 @@ async fn does_not_restore_for_encoded_streaming_response() {
             .is_some_and(|resp| resp.headers.contains_key(http::header::CONTENT_ENCODING)),
         "Content-Encoding must be preserved so the client can still decode the stream"
     );
+    // #1150 review: an encoded stream is passed through verbatim, so the
+    // persistence-source restore must stay disarmed to match the untouched wire.
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .expect("state should be present")
+            .previous_response_id_stream_restore_armed,
+        "an encoded event stream must not arm the store-source restore flag"
+    );
 
     let original = concat!(
         "event: response.completed\n",
@@ -2248,6 +2000,16 @@ async fn does_not_restore_for_non_ok_streaming_response() {
     assert!(
         !ctx.response_headers_modified,
         "a non-200 event stream must not be rewritten"
+    );
+    // #1150 review: the wire is left untouched, so the persistence-source restore
+    // must stay disarmed or a later GET would report a previous_response_id the
+    // streamed response never carried.
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .expect("state should be present")
+            .previous_response_id_stream_restore_armed,
+        "a non-200 event stream must not arm the store-source restore flag"
     );
 
     let original = concat!(
@@ -2312,6 +2074,17 @@ async fn declines_streaming_response_with_body_validators() {
     assert!(
         !ctx.response_headers_modified,
         "a validator-bearing event stream must be declined as an untouched passthrough"
+    );
+    // #1150 review: because the wire frames are passed through with the backend's
+    // null previous_response_id intact, the persistence-source restore must stay
+    // disarmed so `canonicalize_logical_response` cannot rewrite the stored record
+    // into disagreeing with the streamed terminal.
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .expect("state should be present")
+            .previous_response_id_stream_restore_armed,
+        "a validator-bearing event stream must not arm the store-source restore flag"
     );
 
     let headers = &ctx
@@ -3622,6 +3395,40 @@ impl ResponseStore for MockStore {
 
     async fn delete_response(&self, _tenant_id: &str, _id: &str) -> Result<bool, StoreError> {
         Ok(false)
+    }
+
+    async fn consume_approvals(
+        &self,
+        _tenant_id: &str,
+        _response_id: &str,
+        _approval_ids: &[&str],
+        _consumed_at: i64,
+    ) -> Result<Option<usize>, StoreError> {
+        // Rehydration never consumes approvals; this stub exists only to
+        // satisfy the trait. Report a fresh claim so any accidental call
+        // is obvious in a test rather than silently swallowed.
+        Ok(None)
+    }
+
+    async fn record_pending_approvals(
+        &self,
+        _tenant_id: &str,
+        _response_id: &str,
+        _records: &[PendingApprovalRecord],
+        _created_at: i64,
+    ) -> Result<(), StoreError> {
+        // Rehydration never issues approvals; this stub satisfies the trait.
+        Ok(())
+    }
+
+    async fn get_pending_approvals(
+        &self,
+        _tenant_id: &str,
+        _response_id: &str,
+        _approval_ids: &[&str],
+    ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
+        // Rehydration never issues approvals; this stub satisfies the trait.
+        Ok(Vec::new())
     }
 
     async fn get_conversation(
