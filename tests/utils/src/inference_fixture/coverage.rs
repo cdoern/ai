@@ -1245,6 +1245,7 @@ mod tests {
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
+                vec!["responses_agentic_loop"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
@@ -1300,6 +1301,7 @@ mod tests {
                 "messages/native-tool-use",
                 "messages/typed-server-tools",
                 "messages/upstream-error",
+                "responses/agentic-deferred-mcp-connectors",
                 "responses/agentic-parallel-tool-calls",
                 "responses/agentic-status-less-function-call",
                 "responses/chat-basic-nonstream",
@@ -1442,6 +1444,10 @@ mod tests {
                 (
                     &"responses.agentic.irr_terminal_streaming".to_owned(),
                     &vec!["responses/irr-terminal-streaming".to_owned()]
+                ),
+                (
+                    &"responses.agentic.deferred_mcp_connectors".to_owned(),
+                    &vec!["responses/agentic-deferred-mcp-connectors".to_owned()]
                 ),
                 (
                     &"responses.chat.continuation".to_owned(),

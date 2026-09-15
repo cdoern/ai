@@ -44,6 +44,7 @@ The manifest declares **25 features** across **5 scopes**, linked to **25 scenar
 | `responses_agentic_loop` | `responses.agentic.parallel_tool_calls` | `synthetic_only` | `responses/agentic-parallel-tool-calls` | `synthetic`: `synthetic_only` |
 | `responses_agentic_loop` | `responses.agentic.status_less_function_call` | `synthetic_only` | `responses/agentic-status-less-function-call` | `synthetic`: `synthetic_only` |
 | `responses_agentic_loop` | `responses.agentic.irr_terminal_streaming` | `synthetic_only` | `responses/irr-terminal-streaming` | `synthetic`: `synthetic_only` |
+| `responses_agentic_loop` | `responses.agentic.deferred_mcp_connectors` | `synthetic_only` | `responses/agentic-deferred-mcp-connectors` | `synthetic`: `synthetic_only` |
 | `responses_to_chat_completions` | `responses.chat.continuation` | `synthetic_only` | `responses/chat-basic-nonstream` | `synthetic`: `synthetic_only` |
 | `responses_to_chat_completions` | `responses.chat.malformed_compaction` | `synthetic_only` | `responses/chat-malformed-compaction` | `synthetic`: `synthetic_only` |
 | `responses_to_chat_completions` | `responses.chat.unrepresentable_parameters` | `synthetic_only` | `responses/chat-unrepresentable-parameters` | `synthetic`: `synthetic_only` |
