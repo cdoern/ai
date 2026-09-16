@@ -36,6 +36,12 @@ use crate::{
 /// JSON media type used by all Conversations bodies.
 const JSON_CONTENT_TYPE: &str = "application/json";
 
+/// Application protocol these operations belong to.
+///
+/// Declared beside the registry that owns it, so registering a protocol
+/// never edits a shared list.
+const APPLICATION_PROTOCOL: ApplicationProtocol = ApplicationProtocol::new("openai_conversations");
+
 /// Static metadata for one Conversations operation.
 #[derive(Clone, Copy)]
 pub struct ConversationOperationSpec {
@@ -217,7 +223,7 @@ macro_rules! conversation_operations {
                     operation: ConversationOperation::$operation,
                     definition: OpenAiOperationSpec {
                         runtime: OperationSpec {
-                            application_protocol: ApplicationProtocol::OPENAI_CONVERSATIONS,
+                            application_protocol: APPLICATION_PROTOCOL,
                             operation_id: $operation_id,
                             method: HttpMethod::$method,
                             transport: Transport::Http,
@@ -435,9 +441,11 @@ mod tests {
             .map(|spec| spec.operation_id())
             .collect::<BTreeSet<_>>();
         assert_eq!(operation_ids.len(), OPERATION_SPECS.len());
-        assert!(OPERATION_SPECS.iter().all(|spec| spec.mode() == HandlingMode::Local
-            && spec.mode().owns_contract()
-            && spec.owned_contract().is_some()));
+        assert!(
+            OPERATION_SPECS.iter().all(|spec| spec.mode() == HandlingMode::Local
+                && spec.owns_contract()
+                && spec.owned_contract().is_some())
+        );
     }
 
     #[test]
@@ -477,11 +485,10 @@ mod tests {
     }
 
     #[test]
-    fn handling_modes_classify_contract_ownership() {
-        assert!(!HandlingMode::Passthrough.owns_contract());
-        assert!(!HandlingMode::Inspect.owns_contract());
-        assert!(HandlingMode::Transform.owns_contract());
-        assert!(HandlingMode::Local.owns_contract());
+    fn every_conversations_operation_owns_its_contract() {
+        // Conversations is served locally, so Praxis owns each externally
+        // visible contract and generates it into the implementation document.
+        assert!(OPERATION_SPECS.iter().all(|spec| spec.owns_contract()));
     }
 
     #[test]

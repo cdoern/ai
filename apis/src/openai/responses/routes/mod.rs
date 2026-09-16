@@ -22,6 +22,12 @@ use crate::{
     },
 };
 
+/// Application protocol these operations belong to.
+///
+/// Declared beside the registry that owns it, so registering a protocol
+/// never edits a shared list.
+const APPLICATION_PROTOCOL: ApplicationProtocol = ApplicationProtocol::new("openai_responses");
+
 /// Static metadata for one Responses operation.
 #[derive(Clone, Copy)]
 pub struct ResponsesOperationSpec {
@@ -88,7 +94,7 @@ macro_rules! responses_operations {
                     operation: ResponsesOperation::$operation,
                     definition: OpenAiOperationSpec {
                         runtime: OperationSpec {
-                            application_protocol: ApplicationProtocol::OPENAI_RESPONSES,
+                            application_protocol: APPLICATION_PROTOCOL,
                             operation_id: $operation_id,
                             method: HttpMethod::$method,
                             transport: Transport::$transport,

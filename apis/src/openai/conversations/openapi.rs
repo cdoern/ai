@@ -72,7 +72,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         let expected = operation_specs()
             .iter()
-            .filter(|spec| spec.owned_contract().is_some() && spec.mode().owns_contract())
+            .filter(|spec| spec.owned_contract().is_some() && spec.owns_contract())
             .map(|spec| (spec.method().as_str(), spec.spec_path))
             .collect::<BTreeSet<_>>();
 

@@ -169,10 +169,14 @@ fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: OpenAiOperationMatch)
 // Classification
 // -----------------------------------------------------------------------------
 
-/// Match a request head against every registered API family.
+/// Match a request head against every registered OpenAI protocol.
 ///
-/// Families are consulted in registration order. Their path spaces do not
+/// Registries are consulted in registration order. Their path spaces do not
 /// overlap, so at most one can match a given method and path.
+///
+/// Only OpenAI protocols are registered today. The matcher itself is
+/// protocol-agnostic, so when a second provider lands this should iterate a
+/// registry list rather than grow another `if let`.
 fn classify(method: &str, path: &str, transport: Transport) -> Option<OpenAiOperationMatch> {
     if let Some(route) = conversations_routes::match_route(method, path) {
         // Conversations is reached over plain HTTP only.

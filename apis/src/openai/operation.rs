@@ -182,7 +182,7 @@ pub(crate) struct OwnedOperationContract {
 #[derive(Clone, Copy)]
 pub struct OpenAiOperationSpec {
     /// Runtime identity shared with every other protocol registry.
-    pub runtime: OperationSpec,
+    pub(crate) runtime: OperationSpec,
     /// Path as it appears in the OpenAI spec, without `/v1`.
     pub spec_path: &'static str,
     /// Contract generated into the implementation `OpenAPI` document.
@@ -230,6 +230,16 @@ impl OpenAiOperationSpec {
     #[must_use]
     pub const fn mode(&self) -> HandlingMode {
         self.runtime.mode
+    }
+
+    /// Whether Praxis owns this operation's externally visible contract.
+    ///
+    /// Contract ownership is `OpenAPI` generation policy rather than runtime
+    /// identity, so it lives on the OpenAI wrapper beside the contract it
+    /// governs rather than on the shared handling mode.
+    #[must_use]
+    pub const fn owns_contract(&self) -> bool {
+        matches!(self.runtime.mode, HandlingMode::Transform | HandlingMode::Local)
     }
 
     /// Whether this operation consumes a request body.
@@ -284,7 +294,7 @@ where
         let Some(contract) = spec.owned_contract() else {
             continue;
         };
-        if !spec.mode().owns_contract() {
+        if !spec.owns_contract() {
             continue;
         }
 
@@ -382,6 +392,9 @@ mod tests {
 
     use super::*;
 
+    /// Files protocol identifier, for these tests only.
+    const OPENAI_FILES: ApplicationProtocol = ApplicationProtocol::new("openai_files");
+
     /// Representative multipart upload form.
     #[derive(ToSchema)]
     #[expect(dead_code, reason = "schema-only test contract")]
@@ -401,7 +414,7 @@ mod tests {
     /// Files-like operation exercising non-JSON and multiple response shapes.
     const FILE_OPERATION: OpenAiOperationSpec = OpenAiOperationSpec {
         runtime: OperationSpec {
-            application_protocol: ApplicationProtocol::OPENAI_FILES,
+            application_protocol: OPENAI_FILES,
             operation_id: "createFile",
             method: HttpMethod::Post,
             transport: Transport::Http,
@@ -434,7 +447,7 @@ mod tests {
     /// Proxied upload: a real multipart body with no Praxis-owned contract.
     const PROXIED_UPLOAD: OpenAiOperationSpec = OpenAiOperationSpec {
         runtime: OperationSpec {
-            application_protocol: ApplicationProtocol::OPENAI_FILES,
+            application_protocol: OPENAI_FILES,
             operation_id: "createUpload",
             method: HttpMethod::Post,
             transport: Transport::Http,
@@ -449,7 +462,7 @@ mod tests {
     /// Proxied bodyless read.
     const PROXIED_GET: OpenAiOperationSpec = OpenAiOperationSpec {
         runtime: OperationSpec {
-            application_protocol: ApplicationProtocol::OPENAI_FILES,
+            application_protocol: OPENAI_FILES,
             operation_id: "getUpload",
             method: HttpMethod::Get,
             transport: Transport::Http,
@@ -463,7 +476,7 @@ mod tests {
 
     #[test]
     fn request_body_shape_is_independent_of_contract_ownership() {
-        assert!(!PROXIED_UPLOAD.mode().owns_contract());
+        assert!(!PROXIED_UPLOAD.owns_contract());
         assert!(PROXIED_UPLOAD.owned_contract().is_none());
         assert!(
             PROXIED_UPLOAD.has_request_body(),

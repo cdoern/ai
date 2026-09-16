@@ -52,7 +52,10 @@ async fn classifies_a_conversations_operation() {
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied().unwrap();
-    assert_eq!(matched.application_protocol, ApplicationProtocol::OPENAI_CONVERSATIONS);
+    assert_eq!(
+        matched.application_protocol,
+        ApplicationProtocol::new("openai_conversations")
+    );
     assert_eq!(matched.operation_id, "getConversation");
     assert_eq!(matched.transport, Transport::Http);
 
@@ -78,7 +81,10 @@ async fn classifies_a_responses_operation() {
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied().unwrap();
-    assert_eq!(matched.application_protocol, ApplicationProtocol::OPENAI_RESPONSES);
+    assert_eq!(
+        matched.application_protocol,
+        ApplicationProtocol::new("openai_responses")
+    );
     assert_eq!(matched.operation_id, "createResponse");
 }
 

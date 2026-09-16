@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
 //! Provider-neutral runtime operation identity.
@@ -16,30 +16,27 @@
 
 /// Application protocol an operation belongs to.
 ///
-/// Deliberately open-ended rather than an enum: registering a new protocol is
-/// adding a constant beside its registry, not editing a central list every
-/// provider must agree on. Values are provider-qualified so `openai_responses`
-/// and `anthropic_messages` share one identifier space.
+/// Deliberately open-ended rather than an enum: a registry declares its own
+/// identifier beside its operations, so registering a protocol does not edit a
+/// central list every provider must agree on. Values are provider-qualified so
+/// `openai_responses` and `anthropic_messages` share one identifier space.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ApplicationProtocol(&'static str);
 
 impl ApplicationProtocol {
-    /// Anthropic Messages API.
-    pub const ANTHROPIC_MESSAGES: Self = Self("anthropic_messages");
-    /// `OpenAI` Chat Completions API.
-    pub const OPENAI_CHAT_COMPLETIONS: Self = Self("openai_chat_completions");
-    /// `OpenAI` Conversations API.
-    pub const OPENAI_CONVERSATIONS: Self = Self("openai_conversations");
-    /// `OpenAI` Files API.
-    pub const OPENAI_FILES: Self = Self("openai_files");
-    /// `OpenAI` Responses API.
-    pub const OPENAI_RESPONSES: Self = Self("openai_responses");
-    /// `OpenAI` Vector Stores API.
-    pub const OPENAI_VECTOR_STORES: Self = Self("openai_vector_stores");
-
-    /// Declare a protocol identifier not covered by the canonical constants.
+    /// Declare one protocol identifier.
+    ///
+    /// Each registry declares its own beside its operations, so adding a
+    /// protocol does not touch this module.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the identifier is empty. Identifiers are `'static` and
+    /// declared as constants, so this is a compile-time error at every real
+    /// call site rather than a runtime failure.
     #[must_use]
     pub const fn new(value: &'static str) -> Self {
+        assert!(!value.is_empty(), "application protocol identifier must not be empty");
         Self(value)
     }
 
@@ -135,12 +132,6 @@ impl HandlingMode {
             Self::Local => "local",
         }
     }
-
-    /// Whether Praxis owns the operation's externally visible contract.
-    #[must_use]
-    pub const fn owns_contract(self) -> bool {
-        matches!(self, Self::Transform | Self::Local)
-    }
 }
 
 /// Runtime request-body shape, independent of contract ownership.
@@ -203,7 +194,7 @@ impl RequestBody {
 /// specification provenance and generated contracts live in the provider's own
 /// wrapper type.
 #[derive(Clone, Copy, Debug)]
-pub struct OperationSpec {
+pub(crate) struct OperationSpec {
     /// Application protocol that owns the operation.
     pub application_protocol: ApplicationProtocol,
     /// Stable operation ID.
@@ -226,7 +217,7 @@ impl OperationSpec {
     /// Answers the runtime question directly rather than inferring it from
     /// contract ownership, so proxied operations report their real body shape.
     #[must_use]
-    pub const fn has_request_body(&self) -> bool {
+    pub(crate) const fn has_request_body(&self) -> bool {
         self.request_body.is_present()
     }
 
@@ -247,7 +238,7 @@ impl OperationSpec {
 /// Registries may hold bare [`OperationSpec`] values or wrap them in a richer
 /// type carrying provider-specific data, so the shared matcher reads the shared
 /// metadata through this trait rather than requiring one representation.
-pub trait OperationEntry {
+pub(crate) trait OperationEntry {
     /// Borrow the shared operation metadata for this entry.
     fn spec(&self) -> &OperationSpec;
 }
@@ -263,7 +254,7 @@ impl OperationEntry for OperationSpec {
 /// The deepest OpenAI path templates carry two parameters. The headroom keeps
 /// the capacity from binding as other protocols register their operations, and
 /// a registry test fails if a template ever exceeds it.
-pub const MAX_PATH_PARAMS: usize = 4;
+pub(crate) const MAX_PATH_PARAMS: usize = 4;
 
 /// Path parameters borrowed directly from the request URI.
 ///
@@ -271,7 +262,7 @@ pub const MAX_PATH_PARAMS: usize = 4;
 /// matcher can serve every protocol. The fixed-capacity array keeps matching
 /// allocation-free on the request path.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct RouteParams<'a> {
+pub(crate) struct RouteParams<'a> {
     /// Captured parameter names paired with their borrowed path segments.
     pairs: [(&'static str, &'a str); MAX_PATH_PARAMS],
     /// Number of occupied slots.
@@ -281,6 +272,12 @@ pub struct RouteParams<'a> {
 impl<'a> RouteParams<'a> {
     /// Record one captured parameter, failing when capacity is exhausted.
     fn insert(&mut self, name: &'static str, value: &'a str) -> Option<()> {
+        // A template repeating a name, such as `{id}/{id}`, has no single
+        // answer for `get`, so the match fails rather than silently keeping
+        // the first segment.
+        if self.get(name).is_some() {
+            return None;
+        }
         let slot = self.pairs.get_mut(self.len)?;
         *slot = (name, value);
         self.len += 1;
@@ -289,7 +286,7 @@ impl<'a> RouteParams<'a> {
 
     /// Borrow one captured parameter by template name.
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<&'a str> {
+    pub(crate) fn get(&self, name: &str) -> Option<&'a str> {
         self.pairs
             .get(..self.len)?
             .iter()
@@ -300,11 +297,11 @@ impl<'a> RouteParams<'a> {
 
 /// One operation matched from a request head.
 #[derive(Clone, Copy)]
-pub struct MatchedOperation<'a, T: 'static> {
+pub(crate) struct MatchedOperation<'a, T: 'static> {
     /// Matched registry entry, in the registry's own wrapper type.
-    pub spec: &'static T,
+    pub(crate) spec: &'static T,
     /// Borrowed path parameters.
-    pub params: RouteParams<'a>,
+    pub(crate) params: RouteParams<'a>,
 }
 
 /// Whether one template segment declares a path parameter.
@@ -330,7 +327,7 @@ fn normalize_path(path: &str) -> &str {
 ///
 /// Nothing from the request is cloned: path parameters borrow directly from the
 /// caller's path.
-pub fn match_operation<'a, T>(
+pub(crate) fn match_operation<'a, T>(
     specs: &'static [T],
     method: &str,
     path: &'a str,
@@ -385,10 +382,16 @@ fn match_path_template<'a>(template: &'static str, path: &'a str) -> Option<Rout
 mod tests {
     use super::*;
 
+    /// Protocol identifiers for this module's tests only. Real registries
+    /// declare their own beside their operations.
+    const OPENAI_RESPONSES: ApplicationProtocol = ApplicationProtocol::new("openai_responses");
+    /// Stand-in for a second protocol, to show the matcher does not branch.
+    const ANTHROPIC_MESSAGES: ApplicationProtocol = ApplicationProtocol::new("anthropic_messages");
+
     /// Two protocols sharing a matcher, declared without touching this module.
     const SPECS: &[OperationSpec] = &[
         OperationSpec {
-            application_protocol: ApplicationProtocol::OPENAI_RESPONSES,
+            application_protocol: OPENAI_RESPONSES,
             operation_id: "createResponse",
             method: HttpMethod::Post,
             transport: Transport::Http,
@@ -397,7 +400,7 @@ mod tests {
             request_body: RequestBody::Json { required: true },
         },
         OperationSpec {
-            application_protocol: ApplicationProtocol::OPENAI_RESPONSES,
+            application_protocol: OPENAI_RESPONSES,
             operation_id: "getResponse",
             method: HttpMethod::Get,
             transport: Transport::Http,
@@ -406,7 +409,7 @@ mod tests {
             request_body: RequestBody::None,
         },
         OperationSpec {
-            application_protocol: ApplicationProtocol::OPENAI_RESPONSES,
+            application_protocol: OPENAI_RESPONSES,
             operation_id: "getInputTokenCounts",
             method: HttpMethod::Get,
             transport: Transport::Http,
@@ -415,7 +418,7 @@ mod tests {
             request_body: RequestBody::None,
         },
         OperationSpec {
-            application_protocol: ApplicationProtocol::ANTHROPIC_MESSAGES,
+            application_protocol: ANTHROPIC_MESSAGES,
             operation_id: "createMessage",
             method: HttpMethod::Post,
             transport: Transport::Http,
@@ -425,18 +428,17 @@ mod tests {
         },
     ];
 
+    /// The slice below is hand-built. It shows the matcher does not branch on
+    /// protocol; it is not evidence that two shipped registries share it. Only
+    /// OpenAI registries exist today.
     #[test]
-    fn one_matcher_serves_several_protocols() {
+    fn the_matcher_does_not_branch_on_protocol() {
         let responses = match_operation(SPECS, "POST", "/v1/responses", Transport::Http).unwrap();
-        assert_eq!(
-            responses.spec.application_protocol,
-            ApplicationProtocol::OPENAI_RESPONSES
-        );
+        assert_eq!(responses.spec.application_protocol, OPENAI_RESPONSES);
 
         let messages = match_operation(SPECS, "POST", "/v1/messages", Transport::Http).unwrap();
         assert_eq!(
-            messages.spec.application_protocol,
-            ApplicationProtocol::ANTHROPIC_MESSAGES,
+            messages.spec.application_protocol, ANTHROPIC_MESSAGES,
             "the matcher must not branch on provider"
         );
     }
@@ -459,6 +461,50 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_parameter_name() {
+        let mut params = RouteParams::default();
+        assert!(params.insert("id", "first").is_some());
+        assert!(
+            params.insert("id", "second").is_none(),
+            "a repeated parameter name must fail the match rather than overwrite"
+        );
+        assert_eq!(params.get("id"), Some("first"));
+    }
+
+    #[test]
+    fn rejects_more_parameters_than_capacity() {
+        let names = ["a", "b", "c", "d"];
+        assert_eq!(names.len(), MAX_PATH_PARAMS, "this test must fill exactly the capacity");
+
+        let mut params = RouteParams::default();
+        for name in names {
+            assert!(params.insert(name, "value").is_some());
+        }
+        assert!(
+            params.insert("overflow", "value").is_none(),
+            "exceeding capacity must fail the match rather than drop a parameter"
+        );
+    }
+
+    #[test]
+    fn a_template_repeating_a_parameter_name_does_not_match() {
+        const REPEATED: &[OperationSpec] = &[OperationSpec {
+            application_protocol: ApplicationProtocol::new("test_protocol"),
+            operation_id: "repeated",
+            method: HttpMethod::Get,
+            transport: Transport::Http,
+            runtime_path: "/v1/thing/{id}/{id}",
+            mode: HandlingMode::Passthrough,
+            request_body: RequestBody::None,
+        }];
+
+        assert!(
+            match_operation(REPEATED, "GET", "/v1/thing/a/b", Transport::Http).is_none(),
+            "a template cannot bind one name twice"
+        );
+    }
+
+    #[test]
     fn transport_is_part_of_identity() {
         assert!(match_operation(SPECS, "POST", "/v1/responses", Transport::WebSocket).is_none());
     }
@@ -471,10 +517,16 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "must not be empty")]
+    fn an_empty_protocol_identifier_is_rejected() {
+        let _empty = ApplicationProtocol::new("");
+    }
+
+    #[test]
     fn protocol_identifiers_are_open_ended() {
         const CUSTOM: ApplicationProtocol = ApplicationProtocol::new("vendor_custom_api");
         assert_eq!(CUSTOM.as_str(), "vendor_custom_api");
-        assert_eq!(ApplicationProtocol::OPENAI_RESPONSES.as_str(), "openai_responses");
-        assert_eq!(ApplicationProtocol::ANTHROPIC_MESSAGES.as_str(), "anthropic_messages");
+        assert_eq!(OPENAI_RESPONSES.as_str(), "openai_responses");
+        assert_eq!(ANTHROPIC_MESSAGES.as_str(), "anthropic_messages");
     }
 }
