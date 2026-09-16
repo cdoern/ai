@@ -47,7 +47,7 @@
             "value": {
               "error": {
                 "code": "invalid_request_error",
-                "message": "Responses `background` value true has no Chat Completions representation; this adapter supports only `background` false",
+                "message": "Responses `background` has no Chat Completions representation: got true, this adapter supports only `background` false",
                 "param": null,
                 "type": "invalid_request_error"
               }
@@ -107,7 +107,7 @@
             "value": {
               "error": {
                 "code": "invalid_request_error",
-                "message": "Responses `truncation` value \"auto\" has no Chat Completions representation; this adapter supports only `truncation` \"disabled\"",
+                "message": "Responses `truncation` has no Chat Completions representation: got \"auto\", this adapter supports only `truncation` \"disabled\"",
                 "param": null,
                 "type": "invalid_request_error"
               }

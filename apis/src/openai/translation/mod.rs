@@ -47,7 +47,7 @@ mod tests {
         let error = map_error(&json!({"model": "m", "input": "hello", "background": true}));
         assert_eq!(
             error,
-            "Responses `background` value true has no Chat Completions representation; \
+            "Responses `background` has no Chat Completions representation: got true, \
              this adapter supports only `background` false"
         );
     }
@@ -57,7 +57,7 @@ mod tests {
         let error = map_error(&json!({"model": "m", "input": "hello", "truncation": "auto"}));
         assert_eq!(
             error,
-            "Responses `truncation` value \"auto\" has no Chat Completions representation; \
+            "Responses `truncation` has no Chat Completions representation: got \"auto\", \
              this adapter supports only `truncation` \"disabled\""
         );
     }
@@ -95,12 +95,12 @@ mod tests {
         // otherwise be dropped and then reported back as the default.
         assert_eq!(
             map_error(&json!({"model": "m", "input": "hello", "background": "yes"})),
-            "Responses `background` value \"yes\" has no Chat Completions representation; \
+            "Responses `background` has no Chat Completions representation: got string, \
              this adapter supports only `background` false"
         );
         assert_eq!(
             map_error(&json!({"model": "m", "input": "hello", "truncation": 7})),
-            "Responses `truncation` value 7 has no Chat Completions representation; \
+            "Responses `truncation` has no Chat Completions representation: got number, \
              this adapter supports only `truncation` \"disabled\""
         );
     }

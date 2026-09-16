@@ -257,14 +257,16 @@ pub(crate) enum TranslationError {
     InvalidFileSearchTool(&'static str),
     /// A Responses request parameter describes behavior this adapter cannot provide.
     #[error(
-        "Responses `{parameter}` value {value} has no Chat Completions representation; \
-         this adapter supports only `{parameter}` {supported}"
+        "Responses `{parameter}` has no Chat Completions representation: got {value}, \
+         this adapter supports only {supported}"
     )]
     UnrepresentableRequestParameter {
         /// Responses request parameter that cannot be honored.
         parameter: &'static str,
-        /// Requested value, rendered as JSON.
-        value: String,
+        /// Bounded description of the requested value: either a recognized
+        /// literal or the JSON type. Never the value itself, which is
+        /// client-controlled and can be megabytes of JSON.
+        value: &'static str,
         /// The only value this adapter can represent, rendered as JSON.
         supported: &'static str,
     },
@@ -402,8 +404,12 @@ fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), Tra
     {
         return Err(TranslationError::UnrepresentableRequestParameter {
             parameter: "background",
-            value: background.to_string(),
-            supported: "false",
+            value: if background.as_bool() == Some(true) {
+                "true"
+            } else {
+                json_type_name(background)
+            },
+            supported: "`background` false",
         });
     }
 
@@ -412,8 +418,12 @@ fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), Tra
     {
         return Err(TranslationError::UnrepresentableRequestParameter {
             parameter: "truncation",
-            value: truncation.to_string(),
-            supported: "\"disabled\"",
+            value: if truncation.as_str() == Some("auto") {
+                "\"auto\""
+            } else {
+                json_type_name(truncation)
+            },
+            supported: "`truncation` \"disabled\"",
         });
     }
 
