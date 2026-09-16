@@ -173,7 +173,7 @@ pub(crate) struct OwnedOperationContract {
 
 /// One OpenAI operation: shared runtime identity plus OpenAI-owned contract.
 ///
-/// The runtime half is [`OperationSpec`], which the shared matcher understands
+/// The runtime half is the crate's shared `OperationSpec`, which the matcher understands
 /// and every protocol registry uses. The remaining fields are OpenAI's own:
 /// where the operation appears in the pinned OpenAI specification, and the
 /// contract Praxis generates into its implementation `OpenAPI` document. Keeping

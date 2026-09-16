@@ -10,9 +10,9 @@
 //! template, and request-body shape — without naming any provider.
 //!
 //! Contract generation stays with the provider that owns it. A registry may
-//! wrap [`OperationSpec`] in a richer type carrying provider-specific metadata
-//! and expose the shared part through [`OperationEntry`], so the matcher reads
-//! one representation while `OpenAPI` generation keeps its own.
+//! wrap the shared `OperationSpec` in a richer type carrying provider-specific
+//! metadata and expose the shared part through `OperationEntry`, so the matcher
+//! reads one representation while `OpenAPI` generation keeps its own.
 
 /// Application protocol an operation belongs to.
 ///
