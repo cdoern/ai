@@ -35,6 +35,9 @@ pub(crate) mod file_search_callout;
 pub(crate) mod mcp_classify;
 pub(crate) mod mcp_dispatch;
 pub(crate) mod model_rewrite;
+/// Lowers rich client-owned tools to private functions for a function-only
+/// Responses backend and restores the typed items on the response (#1131).
+pub(crate) mod openai_client_tool_compat;
 pub(crate) mod openai_mcp_tool_resolve;
 pub(crate) mod openai_responses_proxy;
 pub(crate) mod openai_tool_parse;
@@ -55,6 +58,7 @@ pub use file_resolve::FileResolveFilter;
 pub use file_search_callout::FileSearchCalloutFilter;
 pub use mcp_dispatch::McpDispatchFilter;
 pub use model_rewrite::ModelRewriteFilter;
+pub use openai_client_tool_compat::ClientToolCompatFilter;
 pub use openai_mcp_tool_resolve::McpToolResolveFilter;
 pub use openai_tool_parse::ToolParseFilter;
 pub use store::ResponseStoreFilter;
@@ -150,10 +154,8 @@ impl io::Write for BoundedJsonCounter {
 /// per-request registry.
 pub(crate) const DEFAULT_STORE_NAME: &str = "default";
 
-/// Metadata key for tenant isolation.
-pub(crate) const TENANT_METADATA_KEY: &str = "responses.tenant_id";
-
-/// Fallback tenant ID when no tenant metadata is present.
+/// Legacy test tenant value retained for fixture compatibility.
+#[cfg(test)]
 pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 
 // -----------------------------------------------------------------------------

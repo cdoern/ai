@@ -33,8 +33,11 @@ use tracing::debug;
 
 use self::config::{OperationClassifierConfig, ValidatedConfig, build_config};
 use crate::{
-    openai::{conversations::routes as conversations_routes, responses::routes as responses_routes},
-    operation::{ApplicationProtocol, OperationEntry as _, Transport},
+    openai::{
+        chat_completions::routes as chat_completions_routes, conversations::routes as conversations_routes,
+        responses::routes as responses_routes,
+    },
+    operation::{ApplicationProtocol, OperationEntry as _, OperationSpec, Transport},
 };
 
 /// Filter name as configured in a pipeline.
@@ -171,35 +174,32 @@ fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: OpenAiOperationMatch)
 
 /// Match a request head against every registered OpenAI protocol.
 ///
-/// Registries are consulted in registration order. Their path spaces do not
-/// overlap, so at most one can match a given method and path.
-///
-/// Only OpenAI protocols are registered today. The matcher itself is
-/// protocol-agnostic, so when a second provider lands this should iterate a
-/// registry list rather than grow another `if let`.
+/// HTTP-only protocols are consulted from a shared list, so adding one does not
+/// introduce Chat- or Conversations-specific branching here. Responses is
+/// matched separately because transport is part of its operation identity.
+/// Path spaces do not overlap, so at most one match can succeed.
 fn classify(method: &str, path: &str, transport: Transport) -> Option<OpenAiOperationMatch> {
-    if let Some(route) = conversations_routes::match_route(method, path) {
-        // Conversations is reached over plain HTTP only.
-        if transport == Transport::Http {
-            let spec = route.spec.spec();
-            return Some(OpenAiOperationMatch {
-                application_protocol: spec.application_protocol,
-                operation_id: spec.operation_id,
-                transport: spec.transport,
-            });
-        }
-    }
+    let http_match = (transport == Transport::Http).then(|| {
+        [
+            conversations_routes::match_route(method, path).map(|route| classified(route.spec.spec())),
+            chat_completions_routes::match_route(method, path).map(|route| classified(route.spec.spec())),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+    });
+    http_match
+        .flatten()
+        .or_else(|| responses_routes::match_route(method, path, transport).map(|route| classified(route.spec.spec())))
+}
 
-    if let Some(route) = responses_routes::match_route(method, path, transport) {
-        let spec = route.spec.spec();
-        return Some(OpenAiOperationMatch {
-            application_protocol: spec.application_protocol,
-            operation_id: spec.operation_id,
-            transport: spec.transport,
-        });
+/// Build the published match from shared operation metadata.
+fn classified(spec: &OperationSpec) -> OpenAiOperationMatch {
+    OpenAiOperationMatch {
+        application_protocol: spec.application_protocol,
+        operation_id: spec.operation_id,
+        transport: spec.transport,
     }
-
-    None
 }
 
 /// Determine the transport a request arrived over.

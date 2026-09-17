@@ -111,6 +111,8 @@ fn register_gcp_filters(registry: &mut FilterRegistry) {
 
 /// Register general-purpose AI filters.
 fn register_general_ai_filters(registry: &mut FilterRegistry) {
+    register_state_owner(registry);
+    register_state_owner_headers(registry);
     #[cfg(feature = "http-callout-filter")]
     praxis_filter::register_filters!(
         @register registry,
@@ -246,6 +248,32 @@ fn register_openai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
     );
 }
 
+/// Register the trusted state owner adapter as security-critical.
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_state_owner(registry: &mut FilterRegistry) {
+    registry
+        .register_with_class(
+            "state_owner",
+            praxis_filter::FilterFactory::Http(std::sync::Arc::new(praxis_ai_apis::StateOwnerFilter::from_config)),
+            praxis_filter::SecurityClass::Security,
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'state_owner'"));
+}
+
+/// Register the destination-bound state-owner header projection as security-critical.
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_state_owner_headers(registry: &mut FilterRegistry) {
+    registry
+        .register_with_class(
+            "state_owner_headers",
+            praxis_filter::FilterFactory::Http(std::sync::Arc::new(
+                praxis_ai_apis::StateOwnerHeadersFilter::from_config,
+            )),
+            praxis_filter::SecurityClass::Security,
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'state_owner_headers'"));
+}
+
 /// Register OpenAI Responses API filters.
 fn register_openai_responses_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     praxis_filter::register_filters!(
@@ -299,6 +327,10 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
     praxis_filter::register_filters!(
         @register registry,
         http "openai_tool_parse" => praxis_ai_apis::openai::ToolParseFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_client_tool_compat" => praxis_ai_apis::openai::ClientToolCompatFilter::from_config
     );
     register_web_search(registry, subrequest_client);
     register_openai_agentic_filters(registry);
@@ -408,26 +440,25 @@ fn register_compact(registry: &mut FilterRegistry, subrequest_client: Option<&Su
     }
 }
 
-/// Register `openai_file_search_callout` with the shared client when
-/// available, otherwise fall back to an isolated per-filter connector.
+/// Register `openai_file_search_callout` as a chain-binding filter.
+///
+/// The filter resolves its configured `outbound_chain` into a prebuilt pipeline
+/// at registration time and routes every vector-store sub-request through it.
+/// It captures the shared sub-request client when available, otherwise a
+/// dedicated per-filter connector with a pool size of 4.
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
 fn register_file_search_callout(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
-    if let Some(client) = subrequest_client {
-        let client = client.clone();
-        registry
-            .register(
-                "openai_file_search_callout",
-                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
-                    praxis_ai_apis::openai::FileSearchCalloutFilter::from_config_with_client(config, client.clone())
-                })),
-            )
-            .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_file_search_callout'"));
-    } else {
-        praxis_filter::register_filters!(
-            @register registry,
-            http "openai_file_search_callout" => praxis_ai_apis::openai::FileSearchCalloutFilter::from_config
-        );
-    }
+    let client = subrequest_client
+        .cloned()
+        .unwrap_or_else(|| SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)));
+    registry
+        .register_chain_binding(
+            "openai_file_search_callout",
+            std::sync::Arc::new(move |config, ctx| {
+                praxis_ai_apis::openai::FileSearchCalloutFilter::from_config_with_binding(config, client.clone(), ctx)
+            }),
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_file_search_callout'"));
 }
 
 /// Register `openai_web_search` with the shared client when
@@ -457,7 +488,14 @@ fn register_web_search(registry: &mut FilterRegistry, subrequest_client: Option<
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::expect_used, reason = "tests")]
 mod tests {
+    use std::collections::HashMap;
+
+    use praxis_core::config::InsecureOptions;
+    use praxis_filter::{FilterEntry, FilterPipeline};
+
     use super::build_ai_registry;
 
     #[test]
@@ -468,6 +506,8 @@ mod tests {
             "ai_guardrails",
             "identity_header_guard",
             "llmisvc_model_provider_resolver",
+            "state_owner",
+            "state_owner_headers",
             "openai_responses_validate",
             "responses_to_chat_completions",
             "a2a",
@@ -522,5 +562,60 @@ mod tests {
         assert!(registry.is_security_filter("azure_ad"));
         #[cfg(feature = "gcp-adc-filter")]
         assert!(registry.is_security_filter("gcp_adc"));
+    }
+
+    /// Deserialize one `openai_file_search_callout` filter entry from YAML.
+    fn file_search_entry(yaml: &str) -> FilterEntry {
+        serde_yaml::from_str(yaml).expect("file_search_callout entry parses")
+    }
+
+    /// `openai_file_search_callout` is a chain-binding filter: it resolves its
+    /// `outbound_chain` into a prebuilt pipeline at build time. An inline chain
+    /// referencing an unknown filter type cannot be built, so the whole pipeline
+    /// build must fail closed rather than register a filter whose outbound
+    /// transport is broken.
+    #[test]
+    fn file_search_callout_rejects_unbuildable_outbound_chain() {
+        let registry = build_ai_registry();
+        let mut entries = vec![file_search_entry(
+            "\
+filter: openai_file_search_callout
+vector_store_url: https://8.8.8.8
+outbound_chain:
+  name: broken-outbound
+  filters:
+    - filter: this_filter_does_not_exist
+",
+        )];
+        let chains = HashMap::new();
+        let result = FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default());
+        assert!(
+            result.is_err(),
+            "an outbound chain referencing an unknown filter must fail the pipeline build"
+        );
+    }
+
+    /// The same registration path builds when the inline outbound chain resolves,
+    /// proving the negative case fails on the chain, not on the filter's own
+    /// configuration.
+    #[test]
+    fn file_search_callout_binds_valid_outbound_chain() {
+        let registry = build_ai_registry();
+        let mut entries = vec![file_search_entry(
+            "\
+filter: openai_file_search_callout
+vector_store_url: https://8.8.8.8
+outbound_chain:
+  name: ok-outbound
+  filters:
+    - filter: headers
+      request_set:
+        - name: X-Vector-Store-Client
+          value: praxis-ai-gateway
+",
+        )];
+        let chains = HashMap::new();
+        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
+            .expect("a resolvable outbound chain must build");
     }
 }

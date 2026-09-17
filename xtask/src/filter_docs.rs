@@ -314,7 +314,7 @@ fn parse_shared_config_items(root: &Path) -> ModuleItems {
     let mut items = ModuleItems::new();
     let praxis_root = root.join("../praxis");
     let dirs = if praxis_root.is_dir() {
-        vec![praxis_root.join("filter/src/builtins/http/payload_processing")]
+        vec![praxis_root.join("crates/filter/src/builtins/http/payload_processing")]
     } else {
         resolve_praxis_source_dirs()
     };
@@ -546,9 +546,10 @@ fn parse_category_shared_types(category_dir: &Path, anchors: &[FilterAnchor], ou
 
 /// Discover filter anchor files under a directory tree.
 ///
-/// An anchor is a `.rs` file containing both `fn name()` and
-/// `fn from_config()`. Duplicate names are preserved so variant
-/// configs, such as MCP broker mode, can be merged into one doc.
+/// An anchor is a `.rs` file containing both `fn name()` and a filter factory
+/// (`fn from_config()` or `fn from_config_with_binding()`). Duplicate names are
+/// preserved so variant configs, such as MCP broker mode, can be merged into one
+/// doc.
 fn discover_filter_anchors(dir: &Path) -> Vec<FilterAnchor> {
     let rs_files = collect_rs_files(dir);
     let mut anchors: Vec<FilterAnchor> = rs_files.iter().filter_map(|path| parse_anchor_file(path)).collect();
@@ -808,7 +809,8 @@ fn build_filter(items: &ModuleItems, name: &str, config_type: Option<&str>) -> F
     let description_doc = items
         .struct_docs
         .iter()
-        .find(|doc| !doc.is_empty())
+        .find(|doc| !extract_yaml_examples(doc).is_empty())
+        .or_else(|| items.struct_docs.iter().find(|doc| !doc.is_empty()))
         .or_else(|| items.module_docs.iter().find(|doc| !doc.is_empty()))
         .cloned()
         .unwrap_or_default();
@@ -1248,19 +1250,30 @@ fn extract_filter_name(imp: &syn::ItemImpl) -> Option<String> {
     })
 }
 
-/// Check if an impl block contains a `from_config` method.
+/// Names of the filter factory methods that mark an impl block as an anchor.
+///
+/// Most filters expose `from_config`; chain-binding filters (which need the
+/// registration-time `ChainBindingContext` to resolve an `outbound_chain`)
+/// expose `from_config_with_binding` instead. Either one marks the impl block as
+/// a filter anchor and carries the `parse_filter_config` call naming the config
+/// type.
+fn is_factory_method(method: &syn::ImplItemFn) -> bool {
+    method.sig.ident == "from_config" || method.sig.ident == "from_config_with_binding"
+}
+
+/// Check if an impl block contains a filter factory method.
 fn has_from_config_method(imp: &syn::ItemImpl) -> bool {
     imp.items
         .iter()
-        .any(|item| matches!(item, syn::ImplItem::Fn(method) if method.sig.ident == "from_config"))
+        .any(|item| matches!(item, syn::ImplItem::Fn(method) if is_factory_method(method)))
 }
 
 /// Extract the config type name from `let cfg: T = parse_filter_config(...)`.
 ///
-/// Scans `from_config` first. When `from_config` delegates to a
-/// private helper (e.g. `build`), the `parse_filter_config` call
-/// lives there instead, so we fall back to scanning other methods
-/// in the same impl block.
+/// Scans the filter factory (`from_config` or `from_config_with_binding`)
+/// first. When the factory delegates to a private helper (e.g. `build`), the
+/// `parse_filter_config` call lives there instead, so we fall back to scanning
+/// other methods in the same impl block.
 fn extract_config_type_name(imp: &syn::ItemImpl) -> Option<String> {
     let methods: Vec<&syn::ImplItemFn> = imp
         .items
@@ -1268,14 +1281,14 @@ fn extract_config_type_name(imp: &syn::ItemImpl) -> Option<String> {
         .filter_map(|item| if let syn::ImplItem::Fn(m) = item { Some(m) } else { None })
         .collect();
 
-    let from_config = methods.iter().find(|m| m.sig.ident == "from_config")?;
-
-    if let Some(name) = scan_method_for_config_type(from_config) {
+    if let Some(factory) = methods.iter().find(|m| is_factory_method(m))
+        && let Some(name) = scan_method_for_config_type(factory)
+    {
         return Some(name);
     }
 
     for method in &methods {
-        if method.sig.ident == "from_config" {
+        if is_factory_method(method) {
             continue;
         }
         if let Some(name) = scan_method_for_config_type(method) {
@@ -2485,6 +2498,31 @@ mod tests {
             vec!["filter: module_filter\nanswer: 42".to_owned()],
             "module-level YAML examples should be rendered"
         );
+    }
+
+    #[test]
+    fn filter_description_prefers_the_struct_that_owns_a_yaml_example() {
+        let source = "
+            /// Unrelated public support type.
+            pub struct SupportType;
+
+            /// Security filter description.
+            ///
+            /// # YAML configuration
+            ///
+            /// ```yaml
+            /// filter: security_filter
+            /// mode: strict
+            /// ```
+            pub struct SecurityFilter;
+        ";
+        let file: syn::File = syn::parse_str(source).unwrap();
+        let mut items = ModuleItems::new();
+        parse_file_items(&file, &mut items);
+
+        let filter = build_filter(&items, "security_filter", None);
+
+        assert_eq!(filter.description, "Security filter description.");
     }
 
     #[test]
