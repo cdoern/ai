@@ -700,11 +700,13 @@ pub(crate) fn user_message_item(text: &str) -> serde_json::Value {
 }
 
 pub(crate) mod rehydrate;
+pub(crate) mod request;
 pub(crate) mod validate;
 pub(crate) mod web_search;
 
 pub use agentic_loop::AgenticLoopFilter;
 pub use compact::CompactFilter;
 pub use rehydrate::RehydrateFilter;
+pub use request::OpenaiResponsesRequestFilter;
 pub use validate::OpenaiResponsesValidateFilter;
 pub use web_search::WebSearchFilter;

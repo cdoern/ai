@@ -291,6 +291,10 @@ fn register_openai_responses_filters(registry: &mut FilterRegistry, subrequest_c
     );
     praxis_filter::register_filters!(
         @register registry,
+        http "openai_responses_request" => praxis_ai_apis::openai::OpenaiResponsesRequestFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
         http "openai_responses_validate" => praxis_ai_apis::openai::OpenaiResponsesValidateFilter::from_config
     );
     praxis_filter::register_filters!(
@@ -575,6 +579,7 @@ mod tests {
             "llmisvc_model_provider_resolver",
             "state_owner",
             "state_owner_headers",
+            "openai_responses_request",
             "openai_responses_validate",
             "responses_to_chat_completions",
             "a2a",

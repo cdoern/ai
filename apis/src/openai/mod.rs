@@ -36,7 +36,7 @@ pub use operation::OpenAiOperationSpec;
 pub use operation_classifier::{OpenAiOperationMatch, OpenaiOperationFilter};
 pub use responses::{
     AgenticLoopFilter, ClientToolCompatFilter, CompactFilter, DocExtractFilter, FileResolveFilter,
-    FileSearchCalloutFilter, McpDispatchFilter, McpToolResolveFilter, ModelRewriteFilter,
+    FileSearchCalloutFilter, McpDispatchFilter, McpToolResolveFilter, ModelRewriteFilter, OpenaiResponsesRequestFilter,
     OpenaiResponsesValidateFilter, RehydrateFilter, ResponseStoreFilter, ResponsesFormatFilter, ToolParseFilter,
     WebSearchFilter,
     openai_responses_proxy::ResponsesProxyFilter,
