@@ -147,17 +147,7 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         };
 
         // The one parse feeds classification, promotion, and state alike.
-        let mut classified = classify_object(obj);
-
-        // The matched operation is authoritative. A valid create body may omit
-        // every discriminator the body heuristics look for — `{"model":"gpt-5"}`
-        // is a legitimate create request — and would otherwise be published as
-        // `unknown`, which makes downstream Responses filters skip it and lets
-        // `background: true` past its rejection. Only unknowns are upgraded, so
-        // a body positively identified as another format keeps that identity.
-        if classified.format == AiRequestFormat::UnknownJson {
-            classified.format = AiRequestFormat::Responses;
-        }
+        let classified = classify_matched_operation(obj);
 
         if let Some(action) = super::handle_unsupported_background(&classified) {
             return Ok(action);
@@ -211,6 +201,24 @@ fn publish_request_facts(
     );
 
     Ok(())
+}
+
+/// Classify a body that the request head already identified as Responses.
+///
+/// The matched operation is authoritative over body heuristics. A valid create
+/// body may omit every discriminator those heuristics look for —
+/// `{"model":"gpt-5"}` is a legitimate create request — and would otherwise be
+/// published as `unknown`, which makes downstream Responses filters skip it and
+/// lets `background: true` past a rejection that keys off the published format.
+///
+/// Only unknown classifications are upgraded, so a body positively identified
+/// as another format keeps that identity and its own handling.
+fn classify_matched_operation(obj: &serde_json::Map<String, serde_json::Value>) -> ClassifiedRequest {
+    let mut classified = classify_object(obj);
+    if classified.format == AiRequestFormat::UnknownJson {
+        classified.format = AiRequestFormat::Responses;
+    }
+    classified
 }
 
 /// Whether this request is the Responses create operation.
