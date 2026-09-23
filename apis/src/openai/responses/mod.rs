@@ -265,7 +265,7 @@ impl ResponsesFormatFilter {
     /// [`FilterError`]: praxis_filter::FilterError
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: ResponsesFormatConfig = parse_filter_config("openai_responses_format", config)?;
-        let validated = build_config(cfg)?;
+        let validated = build_config("openai_responses_format", cfg)?;
         Ok(Box::new(Self { config: validated }))
     }
 }

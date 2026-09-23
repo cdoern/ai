@@ -122,6 +122,96 @@ async fn classification_leaves_the_body_intact_for_state() {
     );
 }
 
+/// A valid create body may carry no discriminator at all. The endpoint is
+/// authoritative, so it must still publish as a Responses request.
+#[tokio::test]
+async fn a_model_only_create_is_classified_from_the_endpoint() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&json!({"model": "gpt-5"})).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Release));
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_format.format")
+            .map(String::as_str),
+        Some("openai_responses"),
+        "body heuristics find no discriminator, but the create endpoint decides"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_some(),
+        "downstream filters gate on the published format, so state must exist too"
+    );
+}
+
+/// Background rejection keys off the published format, so a body without a
+/// discriminator must not slip past it.
+#[tokio::test]
+async fn a_model_only_background_create_is_still_rejected() {
+    let filter = default_filter();
+    let request = create_request();
+    let action = run(
+        filter.as_ref(),
+        &request,
+        &json!({"model": "gpt-5", "background": true}),
+    )
+    .await;
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "an undiscriminated create body must not bypass the background rejection"
+    );
+}
+
+/// A body positively identified as another format keeps that identity.
+#[tokio::test]
+async fn a_positively_classified_body_is_not_relabelled() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-5", "messages": [{"role": "user", "content": "hi"}]})).unwrap(),
+    ));
+
+    drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_format.format")
+            .map(String::as_str),
+        Some("openai_chat_completions"),
+        "only unknown bodies are upgraded by endpoint authority"
+    );
+}
+
+#[test]
+fn unsafe_header_targets_are_rejected_at_construction() {
+    for yaml in [
+        "headers:\n  format: authorization\n",
+        "headers:\n  model: x-api-key\n",
+        "headers:\n  stream: x-praxis-route\n",
+        "headers:\n  mode: content-length\n",
+    ] {
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            OpenaiResponsesRequestFilter::from_config(&value).is_err(),
+            "configuration should be rejected:\n{yaml}"
+        );
+    }
+}
+
+#[test]
+fn dedicated_default_header_targets_are_accepted() {
+    let value: serde_yaml::Value = serde_yaml::from_str(
+        "headers:\n  format: x-praxis-ai-format\n  model: x-praxis-ai-model\n  stream: x-praxis-ai-stream\n",
+    )
+    .unwrap();
+    assert!(OpenaiResponsesRequestFilter::from_config(&value).is_ok());
+}
+
 #[tokio::test]
 async fn a_non_create_responses_operation_is_left_alone() {
     let filter = default_filter();

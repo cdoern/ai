@@ -46,14 +46,14 @@ use praxis_filter::{
 use tracing::{debug, trace};
 
 use super::{
-    config::ResponsesFormatConfig,
+    config::{ResponsesFormatConfig, build_config},
     error::{responses_error_rejection, responses_error_rejection_with_code},
     extract_conversation_id,
     routes::{self as responses_routes, ResponsesOperation},
     state::ResponsesState,
 };
 use crate::{
-    classifier::{ClassifiedRequest, classify_object},
+    classifier::{AiRequestFormat, ClassifiedRequest, classify_object},
     operation::Transport,
 };
 
@@ -92,7 +92,8 @@ impl OpenaiResponsesRequestFilter {
     /// Returns [`FilterError`] when configuration is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: ResponsesFormatConfig = parse_filter_config(FILTER_NAME, config)?;
-        Ok(Box::new(Self { config: cfg }))
+        let validated = build_config(FILTER_NAME, cfg)?;
+        Ok(Box::new(Self { config: validated }))
     }
 }
 
@@ -146,7 +147,17 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         };
 
         // The one parse feeds classification, promotion, and state alike.
-        let classified = classify_object(obj);
+        let mut classified = classify_object(obj);
+
+        // The matched operation is authoritative. A valid create body may omit
+        // every discriminator the body heuristics look for — `{"model":"gpt-5"}`
+        // is a legitimate create request — and would otherwise be published as
+        // `unknown`, which makes downstream Responses filters skip it and lets
+        // `background: true` past its rejection. Only unknowns are upgraded, so
+        // a body positively identified as another format keeps that identity.
+        if classified.format == AiRequestFormat::UnknownJson {
+            classified.format = AiRequestFormat::Responses;
+        }
 
         if let Some(action) = super::handle_unsupported_background(&classified) {
             return Ok(action);
@@ -227,10 +238,7 @@ fn parse_request_body(body: &Option<Bytes>, config: &ResponsesFormatConfig) -> R
         Ok(value) => Ok(value),
         Err(error) => {
             debug!(error = %error, "failed to parse create request body");
-            Err(
-                super::handle_invalid_format(crate::classifier::AiRequestFormat::InvalidJson, config)
-                    .unwrap_or(FilterAction::Release),
-            )
+            Err(super::handle_invalid_format(AiRequestFormat::InvalidJson, config).unwrap_or(FilterAction::Release))
         },
     }
 }
