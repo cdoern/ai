@@ -635,11 +635,8 @@ mod tests {
             "callout_credentials",
             "openai_responses_format",
             "openai_responses_model_rewrite",
-            "openai_responses_request",
-            "openai_responses_validate",
             "openai_tool_parse",
             "openai_operation",
-            "responses_to_chat_completions",
             "a2a",
             "intelligent_route",
             "provider_route",
@@ -651,6 +648,19 @@ mod tests {
         ];
         for name in expected {
             assert!(names.contains(&name), "expected {name} in registry");
+        }
+    }
+
+    #[cfg(feature = "openai-responses")]
+    #[test]
+    fn build_ai_registry_includes_responses_request_when_enabled() {
+        let registry = build_ai_registry();
+        let names = registry.available_filters();
+        for name in ["openai_responses_request", "openai_responses_validate"] {
+            assert!(
+                names.contains(&name),
+                "expected {name} in registry when openai-responses is enabled"
+            );
         }
     }
 
