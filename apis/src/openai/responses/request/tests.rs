@@ -185,6 +185,15 @@ async fn a_positively_classified_body_is_not_relabelled() {
         Some("openai_chat_completions"),
         "only unknown bodies are upgraded by endpoint authority"
     );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "another protocol's body must not gain Responses state, or state-driven \
+         filters would pick up traffic the validation stage used to release"
+    );
+    assert!(
+        !ctx.filter_metadata.contains_key("responses.response_id"),
+        "no proxy-owned Responses identifiers for another protocol's body"
+    );
 }
 
 #[test]

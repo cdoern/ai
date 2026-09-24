@@ -181,14 +181,30 @@ fn publish_request_facts(
     parsed: serde_json::Value,
     config: &ResponsesFormatConfig,
 ) -> Result<(), FilterError> {
-    let response_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
-    let conversation_id = resolve_conversation_id(ctx, &parsed);
     let mode = super::compute_mode(classified);
 
+    // Classification is published for every body, whatever it turned out to
+    // be, exactly as the standalone classifier did.
     super::install_error_formatter(ctx, classified.format);
     super::write_metadata(ctx, classified, mode);
     super::promote_headers(ctx, classified, config, mode);
     super::promote_filter_results(ctx, classified, mode)?;
+
+    // Proxy-owned identifiers and `ResponsesState` are Responses-only. A body
+    // positively identified as another protocol keeps that identity and must
+    // not gain Responses state, or state-driven filters such as the agentic
+    // loop would pick up traffic the previous validation stage released
+    // untouched.
+    if classified.format != AiRequestFormat::Responses {
+        trace!(
+            format = classified.format.as_str(),
+            "classified as another protocol, leaving Responses state uninitialized"
+        );
+        return Ok(());
+    }
+
+    let response_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
+    let conversation_id = resolve_conversation_id(ctx, &parsed);
 
     enrich_context(ctx, classified, &response_id, &conversation_id);
     insert_responses_state(ctx, parsed, &response_id);
