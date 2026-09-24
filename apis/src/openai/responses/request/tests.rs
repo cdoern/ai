@@ -294,27 +294,54 @@ async fn background_mode_is_rejected_before_upstream_contact() {
 }
 
 #[tokio::test]
-async fn a_missing_body_is_rejected() {
-    let filter = default_filter();
-    let request = create_request();
-    let mut ctx = make_filter_context(&request);
-    let mut body = None;
+async fn an_unclassifiable_body_follows_on_invalid_continue() {
+    // The default is `continue`. The classifier this replaces forwarded such a
+    // body and still published its format, so chains that route on those keys
+    // keep working.
+    for (label, body) in [
+        ("missing", None),
+        ("malformed", Some(Bytes::from_static(b"{not json"))),
+        ("non-object", Some(Bytes::from_static(b"\"just a string\""))),
+    ] {
+        let filter = default_filter();
+        let request = create_request();
+        let mut ctx = make_filter_context(&request);
+        let mut body = body;
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Reject(_)), "create requires a body");
+        assert!(matches!(action, FilterAction::Release), "{label} body should forward");
+        let published = ctx
+            .filter_metadata
+            .get("openai_responses_format.format")
+            .map(String::as_str);
+        assert!(
+            published == Some("non_json") || published == Some("invalid_json"),
+            "{label} body should publish its format, got {published:?}"
+        );
+        assert!(
+            ctx.extensions.get::<ResponsesState>().is_none(),
+            "{label} body must not initialize Responses state"
+        );
+    }
 }
 
 #[tokio::test]
-async fn a_non_object_body_is_rejected() {
-    let filter = default_filter();
-    let request = create_request();
-    let action = run(filter.as_ref(), &request, &json!("just a string")).await;
+async fn an_unclassifiable_body_follows_on_invalid_reject() {
+    for (label, body) in [
+        ("missing", None),
+        ("malformed", Some(Bytes::from_static(b"{not json"))),
+        ("non-object", Some(Bytes::from_static(b"\"just a string\""))),
+    ] {
+        let filter = filter("on_invalid: reject\n");
+        let request = create_request();
+        let mut ctx = make_filter_context(&request);
+        let mut body = body;
 
-    assert!(
-        matches!(action, FilterAction::Reject(_)),
-        "a create body must be a JSON object"
-    );
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Reject(_)), "{label} body should reject");
+    }
 }
 
 #[tokio::test]

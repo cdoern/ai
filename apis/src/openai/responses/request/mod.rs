@@ -47,13 +47,13 @@ use tracing::{debug, trace};
 
 use super::{
     config::{ResponsesFormatConfig, build_config},
-    error::{responses_error_rejection, responses_error_rejection_with_code},
+    error::responses_error_rejection_with_code,
     extract_conversation_id,
     routes::{self as responses_routes, ResponsesOperation},
     state::ResponsesState,
 };
 use crate::{
-    classifier::{AiRequestFormat, ClassifiedRequest, classify_object},
+    classifier::{AiRequestFormat, ClassifiedRequest, classify_object, empty_result},
     operation::Transport,
 };
 
@@ -136,18 +136,12 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             return Ok(FilterAction::Release);
         }
 
-        let parsed = match parse_request_body(body, &self.config) {
-            Ok(value) => value,
-            Err(action) => return Ok(action),
+        // The one parse feeds classification, promotion, and state alike. A body
+        // that cannot be classified follows `on_invalid` instead.
+        let (parsed, classified) = match parse_and_classify_create_body(body) {
+            Ok(pair) => pair,
+            Err(format) => return handle_unclassifiable(ctx, format, &self.config),
         };
-
-        let Some(obj) = parsed.as_object() else {
-            debug!("rejecting create request whose body is not a JSON object");
-            return Ok(reject_invalid("request body must be a JSON object"));
-        };
-
-        // The one parse feeds classification, promotion, and state alike.
-        let classified = classify_matched_operation(obj);
 
         if let Some(action) = super::handle_unsupported_background(&classified) {
             return Ok(action);
@@ -185,10 +179,7 @@ fn publish_request_facts(
 
     // Classification is published for every body, whatever it turned out to
     // be, exactly as the standalone classifier did.
-    super::install_error_formatter(ctx, classified.format);
-    super::write_metadata(ctx, classified, mode);
-    super::promote_headers(ctx, classified, config, mode);
-    super::promote_filter_results(ctx, classified, mode)?;
+    publish_classification(ctx, classified, config, mode)?;
 
     // Proxy-owned identifiers and `ResponsesState` are Responses-only. A body
     // positively identified as another protocol keeps that identity and must
@@ -217,6 +208,57 @@ fn publish_request_facts(
     );
 
     Ok(())
+}
+
+/// Publish the classification facts for one body.
+///
+/// Shared by the classified path and the unclassifiable one so both publish the
+/// same keys, as the standalone classifier did for every body it saw.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when a filter result cannot be published.
+fn publish_classification(
+    ctx: &mut HttpFilterContext<'_>,
+    classified: &ClassifiedRequest,
+    config: &ResponsesFormatConfig,
+    mode: Option<&'static str>,
+) -> Result<(), FilterError> {
+    super::install_error_formatter(ctx, classified.format);
+    super::write_metadata(ctx, classified, mode);
+    super::promote_headers(ctx, classified, config, mode);
+    super::promote_filter_results(ctx, classified, mode)
+}
+
+/// Apply `on_invalid` to a body that could not be classified.
+///
+/// `reject` and `error` return the configured rejection. `continue` forwards
+/// the request, but still publishes the `invalid_json` or `non_json` facts, so
+/// a chain that routes or branches on those keys behaves as it did before this
+/// filter replaced the classifier and validator pair.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when a filter result cannot be published.
+fn handle_unclassifiable(
+    ctx: &mut HttpFilterContext<'_>,
+    format: AiRequestFormat,
+    config: &ResponsesFormatConfig,
+) -> Result<FilterAction, FilterError> {
+    if let Some(action) = super::handle_invalid_format(format, config) {
+        debug!(format = format.as_str(), "rejecting unclassifiable create body");
+        return Ok(action);
+    }
+
+    let classified = empty_result(format);
+    let mode = super::compute_mode(&classified);
+    publish_classification(ctx, &classified, config, mode)?;
+
+    debug!(
+        format = format.as_str(),
+        "forwarding unclassifiable create body under on_invalid: continue"
+    );
+    Ok(FilterAction::Release)
 }
 
 /// Classify a body that the request head already identified as Responses.
@@ -248,23 +290,29 @@ fn is_create_response(ctx: &HttpFilterContext<'_>) -> bool {
         .is_some_and(|route| route.spec.operation == ResponsesOperation::CreateResponse)
 }
 
-/// Parse the create request body as JSON.
+/// Parse a create body once and extract its routing facts.
 ///
-/// A body that cannot be parsed is not a classification failure the backend can
-/// resolve, so `on_invalid` governs whether it is rejected here or forwarded.
-fn parse_request_body(body: &Option<Bytes>, config: &ResponsesFormatConfig) -> Result<serde_json::Value, FilterAction> {
-    let Some(chunk) = body.as_deref() else {
-        debug!("rejecting create request with missing body");
-        return Err(reject_invalid("request body is required"));
-    };
-
-    match serde_json::from_slice(chunk) {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            debug!(error = %error, "failed to parse create request body");
-            Err(super::handle_invalid_format(AiRequestFormat::InvalidJson, config).unwrap_or(FilterAction::Release))
-        },
-    }
+/// Returns the parsed value alongside its classification so the caller holds
+/// both from a single deserialization. A missing body is an empty slice rather
+/// than an error, and a top-level value that is not an object is
+/// `invalid_json`, both matching the classifier this filter replaces.
+///
+/// # Errors
+///
+/// Returns the format to publish when the body cannot be classified.
+fn parse_and_classify_create_body(
+    body: &Option<Bytes>,
+) -> Result<(serde_json::Value, ClassifiedRequest), AiRequestFormat> {
+    let bytes: &[u8] = body.as_deref().unwrap_or(&[]);
+    let parsed = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|_ignored| {
+        if bytes.is_empty() {
+            AiRequestFormat::NonJson
+        } else {
+            AiRequestFormat::InvalidJson
+        }
+    })?;
+    let classified = classify_matched_operation(parsed.as_object().ok_or(AiRequestFormat::InvalidJson)?);
+    Ok((parsed, classified))
 }
 
 /// Reject requests that select both supported sources of conversation history.
@@ -279,11 +327,6 @@ fn reject_conflicting_history_selectors(body: &serde_json::Value) -> Option<Filt
             "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
         ))
     })
-}
-
-/// Build a 400 rejection with a Responses API error body.
-fn reject_invalid(message: &str) -> FilterAction {
-    FilterAction::Reject(responses_error_rejection(400, "invalid_request_error", message))
 }
 
 /// Extract or generate a conversation ID for the request.
