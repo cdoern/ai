@@ -54,7 +54,7 @@ use super::{
 };
 use crate::{
     classifier::{AiRequestFormat, ClassifiedRequest, classify_object, empty_result},
-    operation::Transport,
+    operation::{RequestBody, Transport},
 };
 
 /// Filter name as configured in a pipeline.
@@ -128,11 +128,22 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if !is_body_bearing_responses_operation(ctx) {
+        let Some(body_shape) = matched_request_body(ctx) else {
             trace!(
                 method = %ctx.request.method,
                 path = ctx.request.uri.path(),
                 "not a body-bearing Responses operation"
+            );
+            return Ok(FilterAction::Release);
+        };
+
+        // An operation whose body the specification marks optional is complete
+        // without one, so an absent body is not an invalid body and must not
+        // reach `on_invalid`.
+        if !body_shape.is_required() && body.as_deref().is_none_or(<[u8]>::is_empty) {
+            trace!(
+                path = ctx.request.uri.path(),
+                "optional request body absent, nothing to parse"
             );
             return Ok(FilterAction::Release);
         }
@@ -280,21 +291,22 @@ fn classify_matched_operation(obj: &serde_json::Map<String, serde_json::Value>) 
     classified
 }
 
-/// Whether this request is a Responses operation that carries a request body.
+/// The declared request-body shape when this is a body-bearing operation.
 ///
 /// Resolved from the request head through the shared registry — the same source
 /// of truth the `openai_operation` classifier uses — so no body heuristic
 /// decides whether this filter applies, and the filter works whether or not the
 /// classifier is present in the chain.
 ///
-/// The registry already records which operations declare a request body, so
-/// that declaration selects what is worth parsing rather than a hand-written
-/// path list that can drift from it. Bodyless operations — fetch, delete,
-/// cancel, list input items, and the `WebSocket` handshake — are released
-/// untouched.
-fn is_body_bearing_responses_operation(ctx: &HttpFilterContext<'_>) -> bool {
+/// The registry already records which operations declare a request body and
+/// whether it is required, so that declaration selects what is worth parsing
+/// rather than a hand-written path list that can drift from it. Bodyless
+/// operations — fetch, delete, cancel, list input items, and the `WebSocket`
+/// handshake — yield `None` and are released untouched.
+fn matched_request_body(ctx: &HttpFilterContext<'_>) -> Option<RequestBody> {
     responses_routes::match_route(ctx.request.method.as_str(), ctx.request.uri.path(), Transport::Http)
-        .is_some_and(|route| route.spec.request_body().is_present())
+        .map(|route| route.spec.request_body())
+        .filter(|shape| shape.is_present())
 }
 
 /// Parse a create body once and extract its routing facts.

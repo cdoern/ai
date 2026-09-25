@@ -250,6 +250,65 @@ async fn bodyless_responses_operations_are_left_alone() {
     }
 }
 
+/// Compact and input-token-count declare their body optional, so a request
+/// without one is complete and must not be treated as an invalid body.
+#[tokio::test]
+async fn an_absent_optional_body_is_not_an_invalid_body() {
+    for path in ["/v1/responses/compact", "/v1/responses/input_tokens"] {
+        // `reject` is the strictest setting; even there an absent optional body
+        // is legitimate and must pass through.
+        let filter = filter("on_invalid: reject\n");
+        let request = make_request(http::Method::POST, path);
+        let mut ctx = make_filter_context(&request);
+        let mut body = None;
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Release), "{path} should forward");
+        assert!(
+            !ctx.filter_metadata.contains_key("openai_responses_format.format"),
+            "{path} has nothing to classify, so nothing is published"
+        );
+        assert!(
+            ctx.extensions.get::<ResponsesState>().is_none(),
+            "{path} without a body initializes no state"
+        );
+    }
+}
+
+/// Create declares its body required, so an absent one is still an invalid
+/// body and still follows `on_invalid`.
+#[tokio::test]
+async fn an_absent_required_body_still_follows_on_invalid() {
+    let filter = filter("on_invalid: reject\n");
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut body = None;
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "create requires a body, so an absent one is rejected"
+    );
+}
+
+/// A malformed body is an error whether or not the operation required one.
+#[tokio::test]
+async fn a_malformed_optional_body_still_follows_on_invalid() {
+    let filter = filter("on_invalid: reject\n");
+    let request = make_request(http::Method::POST, "/v1/responses/compact");
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from_static(b"{not json"));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "an optional body that was supplied but is malformed is still invalid"
+    );
+}
+
 /// Compact and input-token-count declare a request body in the registry, so
 /// they are parsed and published like create rather than released untouched.
 #[tokio::test]
