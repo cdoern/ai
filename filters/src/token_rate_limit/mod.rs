@@ -5,13 +5,13 @@
 //!
 //! **Experimental.** Requires the `token-rate-limit-filter` cargo
 //! feature, which is off by default and activates the `experimental`
-//! marker. This filter delivers the epic's agreed M1/M2/M6 scope (see
+//! marker. This filter delivers the epic's agreed M1/M2/M6/M7 scope (see
 //! below), but its parent proposal (`00121_token-rate-limiting.md`) is
 //! not yet `accepted`, and open questions remain: HA/clustered-Valkey
 //! failure modes, and this filter's relationship to Kuadrant's
 //! `TokenRateLimitPolicy` (a separate, already-shipped mechanism for
 //! the same problem -- see `ai#127`). The configuration surface may
-//! change between releases. Anything beyond the agreed M1/M2/M6 scope
+//! change between releases. Anything beyond the agreed M1/M2/M6/M7 scope
 //! belongs in `praxis-proxy/experimental` first, not here -- see
 //! `grid#101`.
 //!
@@ -54,9 +54,12 @@
 //! - **Configurable estimation (M3)**: implemented -- per-rule `estimation:` block with pluggable strategies (`fixed`,
 //!   `max_tokens`, `input_plus_max_tokens`, `model_scaled`). See [`config::EstimationConfig`].
 //! - **Multiple budgets per rule, soft-limit tiers**: the proposal allows several `token_budgets` (e.g. hourly + daily)
-//!   and graduated tiers per rule; this milestone admits exactly one budget per rule with a hard deny at capacity.
-//! - **Observability (M7/M8) and metering (S3)**: out of scope here -- both are recommended to split into their own
-//!   follow-on proposals.
+//!   and graduated tiers per rule; this milestone supports one budget per rule with graduated soft-limit tiers
+//!   (`inject` action) and a hard deny at capacity (`deny` action) — see [`config::TierConfig`] and proposal S1.
+//! - **Observability (M7)**: implemented by `ai#883`: bounded Prometheus metrics, privacy-safe accounting records, and
+//!   an optional request-scoped decision span when the `opentelemetry` feature is enabled.
+//! - **Billing-grade metering (S3)**: still out of scope. Accounting records are best-effort operational audit data,
+//!   not a durable billing ledger.
 //! - **Trust boundary, non-inference traffic scoping**: this filter assumes request identity has already been resolved
 //!   upstream (the proposal's own Non-Goals) and does not itself authenticate callers or exempt probes/health
 //!   checks/malformed requests from a catch-all rule's reservation. Scope rules with explicit `match:` conditions, or
@@ -97,6 +100,7 @@ mod tests;
 mod backend;
 mod config;
 mod ledger;
+mod remaining_total;
 mod token_bucket_ledger;
 mod weights;
 
@@ -114,7 +118,7 @@ use metrics::{counter, gauge};
 use praxis_ai_apis::hash::Sha256;
 use praxis_filter::{
     AuthenticatedIdentity, BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
-    parse_filter_config,
+    TrustedHeaderMutation, parse_filter_config,
 };
 
 use self::{
@@ -125,8 +129,8 @@ use self::{
         ValkeyTokenRateLimitBackend,
     },
     config::{
-        BackendConfig, BackendKind, DEFAULT_RESERVATION_TIMEOUT, EstimationConfig, EstimationStrategy, KeySource,
-        MatchConfig, RuleAlgorithm, RuleConfig, TokenRateLimitConfig,
+        ActionType, BackendConfig, BackendKind, DEFAULT_RESERVATION_TIMEOUT, EstimationConfig, EstimationStrategy,
+        KeySource, MatchConfig, RuleAlgorithm, RuleConfig, TierConfig, TokenRateLimitConfig,
     },
     ledger::{Budget, Ledger, LedgerConfig},
     token_bucket_ledger::{TokenBucketConfig, TokenBucketLedger},
@@ -170,6 +174,11 @@ const MAX_KEY_LENGTH: usize = 256;
 
 /// Bound on reservations awaiting reconciliation across all keys, per rule.
 const MAX_ACTIVE_RESERVATIONS: usize = 200_000;
+
+/// Largest exact integer representable by Prometheus's f64 gauge values and
+/// by Valkey's Lua numeric type. Aggregate remaining-budget gauges saturate
+/// here instead of wrapping or reporting backend-dependent precision loss.
+const MAX_REPORTED_REMAINING: u64 = 9_007_199_254_740_991;
 
 /// Maximum request body bytes buffered for body-dependent estimation
 /// strategies. 2 MiB -- generous enough for the largest realistic
@@ -479,7 +488,7 @@ fn resolve_model_multiplier(
 // -----------------------------------------------------------------------------
 
 /// One `rules:` entry, fully resolved: its match condition (if any),
-/// backend, and estimation.
+/// backend, estimation, and graduated enforcement tiers (S1).
 struct CompiledRule {
     /// Human-readable identifier, used in metrics labels and error
     /// messages, and folded into Valkey key namespacing.
@@ -499,6 +508,36 @@ struct CompiledRule {
     /// Resolved per-type weights for this rule (filter defaults overlaid
     /// with the rule's `weights:`). Applied only at reconciliation.
     weights: TokenWeights,
+
+    /// Graduated enforcement tiers (proposal S1), sorted by ascending
+    /// capacity. The last tier may be a `deny` tier (matching the
+    /// algorithm's capacity). When empty, the rule has a single implicit
+    /// deny at the algorithm's capacity (the pre-S1 default).
+    tiers: Vec<CompiledTier>,
+
+    /// Unique header names used by any `inject` tier in this rule.
+    /// Stripped from inbound requests on admission so that clients
+    /// cannot spoof tier signals.
+    inject_header_names: Vec<HeaderName>,
+}
+
+/// One graduated enforcement tier, resolved at config time.
+struct CompiledTier {
+    /// Usage threshold at which this tier activates.
+    capacity: u64,
+    /// What happens when usage crosses this threshold.
+    action: CompiledAction,
+}
+
+/// Pre-validated action for one tier.
+enum CompiledAction {
+    /// Continue the request with these headers injected upstream.
+    Inject {
+        /// Header name-value pairs to set on the upstream request.
+        headers: Vec<(HeaderName, http::HeaderValue)>,
+    },
+    /// Hard-reject with 429 (identical to the existing M6 behavior).
+    Deny,
 }
 
 impl CompiledRule {
@@ -829,6 +868,185 @@ fn validate_fallback_within_capacity(rule_name: &str, fallback: Option<u64>, cap
     Ok(())
 }
 
+/// Validate and compile the optional graduated tier list for one rule.
+///
+/// When `tiers` is `None`, returns an empty `Vec` — the pre-S1 default
+/// behavior (single implicit deny at the algorithm's `capacity`).
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if capacities are not strictly ascending, the
+/// deny tier is not the last, its capacity doesn't match the algorithm's
+/// capacity, an inject tier has no headers, or a header name is invalid.
+fn compile_tiers(
+    rule_name: &str,
+    tiers: Option<Vec<TierConfig>>,
+    algorithm_capacity: u64,
+) -> Result<Vec<CompiledTier>, FilterError> {
+    let Some(tiers) = tiers else {
+        return Ok(Vec::new());
+    };
+    if tiers.is_empty() {
+        return Err(format!("token_rate_limit: rule '{rule_name}': tiers must not be empty when specified").into());
+    }
+
+    let mut compiled = Vec::with_capacity(tiers.len());
+    let mut prev_capacity = 0_u64;
+    let mut saw_deny = false;
+
+    for (index, tier) in tiers.into_iter().enumerate() {
+        validate_tier_ordering(rule_name, index, tier.capacity, prev_capacity, saw_deny)?;
+        prev_capacity = tier.capacity;
+        let action = compile_tier_action(rule_name, index, &tier, algorithm_capacity, &mut saw_deny)?;
+        compiled.push(CompiledTier {
+            capacity: tier.capacity,
+            action,
+        });
+    }
+    Ok(compiled)
+}
+
+/// Collect the de-duplicated set of header names across all `inject`
+/// tiers. These are stripped from the inbound client request so that
+/// downstream schedulers never see a spoofed tier header.
+fn collect_inject_header_names(tiers: &[CompiledTier]) -> Vec<HeaderName> {
+    let mut names = Vec::new();
+    for tier in tiers {
+        if let CompiledAction::Inject { headers } = &tier.action {
+            for (name, _) in headers {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Check tier ordering invariants: strictly ascending, no tier after deny.
+fn validate_tier_ordering(
+    rule_name: &str,
+    index: usize,
+    capacity: u64,
+    prev_capacity: u64,
+    saw_deny: bool,
+) -> Result<(), FilterError> {
+    if saw_deny {
+        return Err(format!(
+            "token_rate_limit: rule '{rule_name}': deny tier must be the last tier \
+             (found tier at index {index} after deny)"
+        )
+        .into());
+    }
+    if capacity == 0 {
+        return Err(
+            format!("token_rate_limit: rule '{rule_name}': tier at index {index} must have capacity > 0").into(),
+        );
+    }
+    if index > 0 && capacity <= prev_capacity {
+        return Err(format!(
+            "token_rate_limit: rule '{rule_name}': tier capacities must be strictly ascending \
+             (tier at index {index} has capacity {capacity} <= previous {prev_capacity})"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Compile a single tier's action, validating headers and deny placement.
+#[expect(
+    clippy::too_many_lines,
+    reason = "validation for both inject (header parsing) and deny (capacity match) is a natural unit"
+)]
+fn compile_tier_action(
+    rule_name: &str,
+    index: usize,
+    tier: &TierConfig,
+    algorithm_capacity: u64,
+    saw_deny: &mut bool,
+) -> Result<CompiledAction, FilterError> {
+    match tier.action.action_type {
+        ActionType::Inject => {
+            if tier.capacity > algorithm_capacity {
+                return Err(format!(
+                    "token_rate_limit: rule '{rule_name}': inject tier at index {index} \
+                     has capacity ({}) above the algorithm's capacity ({algorithm_capacity}); \
+                     it would never fire",
+                    tier.capacity
+                )
+                .into());
+            }
+            if tier.action.headers.is_empty() {
+                return Err(format!(
+                    "token_rate_limit: rule '{rule_name}': inject tier at index {index} must have at least one header"
+                )
+                .into());
+            }
+            let headers = tier
+                .action
+                .headers
+                .iter()
+                .map(|(name, value)| {
+                    let header_name = HeaderName::try_from(name.as_str()).map_err(|error| {
+                        FilterError::from(format!(
+                            "token_rate_limit: rule '{rule_name}': invalid inject header '{name}': {error}"
+                        ))
+                    })?;
+                    let lower = header_name.as_str();
+                    if lower == http::header::HOST.as_str()
+                        || lower == http::header::CONTENT_LENGTH.as_str()
+                        || lower == http::header::TRANSFER_ENCODING.as_str()
+                        || praxis_core::reserved_headers::HOP_BY_HOP_HEADERS.contains(&lower)
+                        || praxis_core::reserved_headers::is_reserved(lower)
+                    {
+                        return Err(FilterError::from(format!(
+                            "token_rate_limit: rule '{rule_name}': inject tier at index {index} \
+                             uses reserved/hop-by-hop header '{lower}'"
+                        )));
+                    }
+                    let header_value = http::HeaderValue::from_str(value).map_err(|error| {
+                        FilterError::from(format!(
+                            "token_rate_limit: rule '{rule_name}': invalid inject header value for '{name}': {error}"
+                        ))
+                    })?;
+                    Ok((header_name, header_value))
+                })
+                .collect::<Result<Vec<_>, FilterError>>()?;
+
+            // Reject duplicate header names after case normalization.
+            // `BTreeMap<String, String>` keys are the raw YAML spelling,
+            // so `X-Token-Tier` and `x-token-tier` both pass syntax
+            // validation but map to the same `HeaderName`.
+            {
+                let mut seen = HashSet::with_capacity(headers.len());
+                for (name, _) in &headers {
+                    if !seen.insert(name.clone()) {
+                        return Err(format!(
+                            "token_rate_limit: rule '{rule_name}': inject tier at index {index} \
+                             has duplicate header '{name}' (after case normalization)"
+                        )
+                        .into());
+                    }
+                }
+            }
+
+            Ok(CompiledAction::Inject { headers })
+        },
+        ActionType::Deny => {
+            if tier.capacity != algorithm_capacity {
+                return Err(format!(
+                    "token_rate_limit: rule '{rule_name}': deny tier capacity ({}) \
+                     must equal the algorithm's capacity ({algorithm_capacity})",
+                    tier.capacity
+                )
+                .into());
+            }
+            *saw_deny = true;
+            Ok(CompiledAction::Deny)
+        },
+    }
+}
+
 /// Compile one YAML `rules:` entry into a [`CompiledRule`], validating
 /// and constructing its backend.
 ///
@@ -851,6 +1069,8 @@ fn compile_rule(
     let matcher = compile_matcher(&rule.name, rule.r#match)?;
     let loc = format!("rule '{}'", rule.name);
     let weights = filter_defaults.overlay(&rule.weights, &loc)?;
+    let tiers = compile_tiers(&rule.name, rule.tiers, capacity)?;
+    let inject_header_names = collect_inject_header_names(&tiers);
 
     Ok(CompiledRule {
         name: rule.name,
@@ -858,6 +1078,8 @@ fn compile_rule(
         backend,
         estimation,
         weights,
+        tiers,
+        inject_header_names,
     })
 }
 
@@ -994,20 +1216,20 @@ impl TokenRateLimitFilter {
     }
 
     /// Resolve the trusted quota key and record a fail-closed identity miss.
-    fn resolve_key_or_record_rejection(&self, ctx: &HttpFilterContext<'_>, rule: &CompiledRule) -> Option<String> {
+    fn resolve_key_or_record_rejection(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        rule: &CompiledRule,
+        estimate: u64,
+    ) -> Option<String> {
         let key = self.resolve_key(ctx);
         if key.is_none() {
             tracing::info!(
                 rule = rule.name,
                 "token_rate_limit: rejecting request (401), no authenticated subject"
             );
-            counter!(
-                "praxis_ai_token_rate_limit_requests_total",
-                "decision" => "denied",
-                "reason" => "missing_authenticated_subject",
-                "rule" => rule.name.clone(),
-            )
-            .increment(1);
+            record_unauthenticated_metric(&rule.name);
+            record_accounting_admission(rule, "denied", estimate, "missing_authenticated_subject");
         }
         key
     }
@@ -1031,10 +1253,10 @@ impl TokenRateLimitFilter {
         rule: &CompiledRule,
         admitted: AdmittedReservation,
     ) {
-        counter!("praxis_ai_token_rate_limit_requests_total", "decision" => "admitted", "rule" => rule.name.clone())
-            .increment(1);
-        counter!("praxis_ai_token_rate_limit_tokens_total", "kind" => "estimated", "rule" => rule.name.clone())
-            .increment(admitted.estimate);
+        record_request_metric(&rule.name, "admitted");
+        record_reserved_metric(&rule.name, admitted.estimate);
+        record_state_metrics(&rule.name, rule.backend.as_ref());
+        record_accounting_admission(rule, "admitted", admitted.estimate, "reserved");
         ctx.set_metadata(META_RESERVATION_ID, admitted.reservation_id.to_string());
         ctx.set_metadata(META_BUCKET_KEY, admitted.key);
         ctx.set_metadata(META_RULE_INDEX, rule_index.to_string());
@@ -1042,9 +1264,10 @@ impl TokenRateLimitFilter {
 
     /// Build the 429 rejection for a denied reservation, including the
     /// token-denominated rate limit headers.
-    fn denied_action(rule: &CompiledRule, retry_after_ms: u64) -> FilterAction {
-        counter!("praxis_ai_token_rate_limit_requests_total", "decision" => "denied", "rule" => rule.name.clone())
-            .increment(1);
+    fn denied_action(rule: &CompiledRule, estimate: u64, retry_after_ms: u64) -> FilterAction {
+        record_request_metric(&rule.name, "denied");
+        record_state_metrics(&rule.name, rule.backend.as_ref());
+        record_accounting_admission(rule, "denied", estimate, "budget_exhausted");
         let retry_secs = retry_after_ms.saturating_add(999) / 1000;
         let retry_secs = retry_secs.max(1);
         FilterAction::Reject(
@@ -1057,8 +1280,13 @@ impl TokenRateLimitFilter {
     }
 
     /// Turn a completed `reserve()` call into the `on_request` result:
-    /// record admission metadata/metrics, build the 429 rejection, or
-    /// fail closed (503) on a backend error.
+    /// record admission metadata/metrics, evaluate graduated tiers and
+    /// inject headers (S1), build the 429 rejection, or fail closed
+    /// (503) on a backend error.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the three outcome arms (admit+tiers / deny / error) are a natural unit"
+    )]
     fn handle_reserve_outcome(
         ctx: &mut HttpFilterContext<'_>,
         rule_index: usize,
@@ -1070,6 +1298,7 @@ impl TokenRateLimitFilter {
             Ok(BackendReserve::Admitted {
                 reservation_id,
                 estimate,
+                usage_after,
             }) => {
                 let admitted = AdmittedReservation {
                     key: pending.key,
@@ -1078,6 +1307,8 @@ impl TokenRateLimitFilter {
                 };
                 Self::record_admission(ctx, rule_index, rule, admitted);
                 ctx.set_metadata(META_ESTIMATE, pending.request_estimate.to_string());
+                Self::evaluate_tiers(ctx, rule, usage_after);
+                record_admission_span(ctx, rule, pending.request_estimate, "admitted");
                 FilterAction::Continue
             },
             Ok(BackendReserve::Denied { retry_after_ms }) => {
@@ -1087,14 +1318,85 @@ impl TokenRateLimitFilter {
                     rule = rule.name,
                     "token_rate_limit: rejecting request (429)"
                 );
-                Self::denied_action(rule, retry_after_ms)
+                record_admission_span(ctx, rule, pending.request_estimate, "denied");
+                Self::denied_action(rule, pending.request_estimate, retry_after_ms)
             },
             Err(error) => {
-                counter!("praxis_ai_token_rate_limit_backend_errors_total", "operation" => "reserve", "rule" => rule.name.clone())
-                    .increment(1);
+                record_backend_error_metric(&rule.name, rule.backend.backend_name());
+                record_accounting_failure(rule, "reserve", &error);
+                record_admission_span(ctx, rule, pending.request_estimate, "error");
                 tracing::error!(%error, rule = rule.name, "token_rate_limit: admission backend failed, failing closed");
                 FilterAction::Reject(Rejection::status(503))
             },
+        }
+    }
+
+    /// Evaluate graduated soft-limit tiers (proposal S1) and inject
+    /// headers for every breached `inject` tier.
+    ///
+    /// Tiers are sorted by ascending `capacity` at compile time. We walk
+    /// from lowest to highest, injecting headers for every tier whose
+    /// threshold is at or below the current `usage_after`. The last tier
+    /// pushed for a given header name wins (Rust's `request_headers_to_set`
+    /// semantics), so a higher tier's header value naturally overrides a
+    /// lower one for the same name — exactly the behavior the proposal
+    /// specifies for overlapping header names across tiers.
+    ///
+    /// ## Client header stripping
+    ///
+    /// All configured inject header names are removed from the inbound
+    /// request *before* any tier values are set, preventing a client
+    /// below threshold from spoofing tier signals.
+    ///
+    /// ## Body-phase ordered mutations
+    ///
+    /// When the filter runs from `on_request_body` (body-dependent
+    /// estimation strategies) and an earlier filter already activated
+    /// the ordered `pre_read_mutations` log, injected headers are also
+    /// pushed there so Core's pre-read replay applies them. This
+    /// mirrors `state_owner_headers::queue_projection` and
+    /// `agentic_loop::queue_continuation_header`.
+    fn evaluate_tiers(ctx: &mut HttpFilterContext<'_>, rule: &CompiledRule, usage_after: u64) {
+        if rule.tiers.is_empty() {
+            return;
+        }
+
+        let ordered = !ctx.pre_read_mutations.is_empty();
+
+        // Strip all configured inject header names from the inbound
+        // request so a client cannot spoof tier signals.
+        for name in &rule.inject_header_names {
+            ctx.request_headers_to_remove.push(name.clone());
+            if ordered {
+                ctx.pre_read_mutations.push(TrustedHeaderMutation::Remove(name.clone()));
+            }
+        }
+
+        for tier in &rule.tiers {
+            if usage_after < tier.capacity {
+                break;
+            }
+            if let CompiledAction::Inject { headers } = &tier.action {
+                counter!(
+                    "praxis_trl_soft_tier_activations_total",
+                    "rule" => rule.name.clone(),
+                    "capacity" => tier.capacity.to_string(),
+                )
+                .increment(1);
+                Self::queue_tier_headers(ctx, headers, ordered);
+            }
+        }
+    }
+
+    /// Push inject-tier headers into the grouped queue and, when the
+    /// ordered pre-read mutation log is active, into that log as well.
+    fn queue_tier_headers(ctx: &mut HttpFilterContext<'_>, headers: &[(HeaderName, http::HeaderValue)], ordered: bool) {
+        for (name, value) in headers {
+            ctx.request_headers_to_set.push((name.clone(), value.clone()));
+            if ordered {
+                ctx.pre_read_mutations
+                    .push(TrustedHeaderMutation::Set(name.clone(), value.clone()));
+            }
         }
     }
 
@@ -1142,9 +1444,14 @@ impl TokenRateLimitFilter {
         let Some((request, rule)) = self.reconciliation_context(ctx) else {
             return;
         };
+        if let Some(actual) = request.actual {
+            record_actual_cost(ctx, actual);
+        }
 
         if let Some(settlement) = rule.backend.reconcile_sync(&request) {
             record_settlement_metrics(&rule.name, &settlement);
+            record_state_metrics(&rule.name, rule.backend.as_ref());
+            record_accounting_settlement(&rule.name, rule.backend.as_ref(), &settlement);
             tracing::debug!(
                 ?settlement,
                 rule = rule.name,
@@ -1153,6 +1460,8 @@ impl TokenRateLimitFilter {
             return;
         }
         if let Err(error) = rule.backend.enqueue_reconcile(request) {
+            record_backend_error_metric(&rule.name, rule.backend.backend_name());
+            record_accounting_failure(rule, "enqueue_reconcile", &error);
             tracing::error!(%error, rule = rule.name, "token_rate_limit: failed to enqueue reconciliation");
         }
     }
@@ -1174,7 +1483,7 @@ struct PendingReservation {
 /// argument-count budget.
 struct AdmittedReservation {
     /// The budget key this reservation was admitted under (see
-    /// [`FALLBACK_KEY`] -- always that sentinel in this milestone).
+    /// [`FALLBACK_KEY`] in global mode, or an opaque subject hash.
     key: String,
     /// The backend-issued reservation ID, stashed for later reconciliation.
     reservation_id: u64,
@@ -1183,10 +1492,42 @@ struct AdmittedReservation {
     estimate: u64,
 }
 
+/// Count an admission outcome using the issue #883 bounded label contract.
+fn record_request_metric(rule_name: &str, result: &'static str) {
+    counter!(
+        "praxis_trl_requests_total",
+        "result" => result,
+        "rule" => rule_name.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Count one request rejected before admission because no trusted
+/// subject could be resolved; `praxis_trl_requests_total` describes
+/// budget decisions only.
+fn record_unauthenticated_metric(rule_name: &str) {
+    counter!("praxis_trl_unauthenticated_total", "rule" => rule_name.to_owned()).increment(1);
+}
+
+/// Count tokens reserved at admission.
+fn record_reserved_metric(rule_name: &str, estimate: u64) {
+    counter!("praxis_trl_tokens_reserved_total", "rule" => rule_name.to_owned()).increment(estimate);
+}
+
+/// Count one bounded backend failure.
+fn record_backend_error_metric(rule_name: &str, backend: &'static str) {
+    counter!(
+        "praxis_trl_backend_errors_total",
+        "backend" => backend,
+        "rule" => rule_name.to_owned(),
+    )
+    .increment(1);
+}
+
 /// Emit gauges/counters for one rule's cleanup pass.
 fn record_cleanup_metrics(rule_name: &str, report: CleanupReport) {
     if report.orphaned > 0 {
-        counter!("praxis_ai_token_rate_limit_reservations_total", "result" => "orphaned", "rule" => rule_name.to_owned())
+        counter!("praxis_trl_reservations_total", "result" => "orphaned", "rule" => rule_name.to_owned())
             .increment(report.orphaned as u64);
     }
     #[expect(
@@ -1194,9 +1535,8 @@ fn record_cleanup_metrics(rule_name: &str, report: CleanupReport) {
         reason = "metrics gauges use f64, bounded by config caps in practice"
     )]
     {
-        gauge!("praxis_ai_token_rate_limit_active_reservations", "rule" => rule_name.to_owned())
-            .set(report.active_reservations as f64);
-        gauge!("praxis_ai_token_rate_limit_active_keys", "rule" => rule_name.to_owned()).set(report.active_keys as f64);
+        gauge!("praxis_trl_reservations_active", "rule" => rule_name.to_owned()).set(report.active_reservations as f64);
+        gauge!("praxis_trl_active_keys", "rule" => rule_name.to_owned()).set(report.active_keys as f64);
     }
 }
 
@@ -1208,16 +1548,122 @@ fn record_settlement_metrics(rule_name: &str, settlement: &BackendSettlement) {
         overage,
     } = *settlement
     {
-        counter!("praxis_ai_token_rate_limit_reservations_total", "result" => "reconciled", "rule" => rule_name.to_owned())
+        counter!("praxis_trl_reservations_total", "result" => "reconciled", "rule" => rule_name.to_owned())
             .increment(1);
-        counter!("praxis_ai_token_rate_limit_tokens_total", "kind" => "actual", "rule" => rule_name.to_owned())
-            .increment(actual);
-        counter!("praxis_ai_token_rate_limit_tokens_total", "kind" => "refunded", "rule" => rule_name.to_owned())
-            .increment(refund);
-        counter!("praxis_ai_token_rate_limit_tokens_total", "kind" => "overage", "rule" => rule_name.to_owned())
-            .increment(overage);
+        counter!("praxis_trl_tokens_reconciled_total", "rule" => rule_name.to_owned()).increment(actual);
+        counter!("praxis_trl_tokens_refunded_total", "rule" => rule_name.to_owned()).increment(refund);
+        counter!("praxis_trl_tokens_overage_total", "rule" => rule_name.to_owned()).increment(overage);
     }
 }
+
+/// Publish the latest rule-level gauges without backend I/O.
+fn record_state_metrics(rule_name: &str, backend: &dyn TokenRateLimitStateBackend) {
+    let snapshot = backend.snapshot();
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "metrics gauges use f64; configured capacities and reservation counts are bounded"
+    )]
+    {
+        gauge!(
+            "praxis_trl_budget_remaining",
+            "algorithm" => backend.algorithm_name(),
+            "rule" => rule_name.to_owned(),
+        )
+        .set(snapshot.budget_remaining as f64);
+        gauge!("praxis_trl_reservations_active", "rule" => rule_name.to_owned())
+            .set(snapshot.active_reservations as f64);
+        gauge!("praxis_trl_active_keys", "rule" => rule_name.to_owned()).set(snapshot.active_keys as f64);
+    }
+}
+
+/// Emit one bounded admission accounting record on its dedicated target.
+fn record_accounting_admission(rule: &CompiledRule, result: &'static str, estimate: u64, outcome: &'static str) {
+    tracing::info!(
+        target: "praxis_ai::token_rate_limit::accounting",
+        phase = "admission",
+        rule = rule.name,
+        algorithm = rule.backend.algorithm_name(),
+        backend = rule.backend.backend_name(),
+        result,
+        estimate,
+        outcome,
+        "token rate limit accounting"
+    );
+}
+
+/// Emit one bounded synchronous-settlement accounting record.
+fn record_accounting_settlement(
+    rule_name: &str,
+    backend: &dyn TokenRateLimitStateBackend,
+    settlement: &BackendSettlement,
+) {
+    if let BackendSettlement::Applied {
+        actual,
+        refund,
+        overage,
+    } = *settlement
+    {
+        tracing::info!(
+            target: "praxis_ai::token_rate_limit::accounting",
+            phase = "reconciliation",
+            rule = rule_name,
+            algorithm = backend.algorithm_name(),
+            backend = backend.backend_name(),
+            result = "applied",
+            actual,
+            refund,
+            overage,
+            "token rate limit accounting"
+        );
+    }
+}
+
+/// Emit a bounded accounting failure without request or user identifiers.
+fn record_accounting_failure(rule: &CompiledRule, operation: &'static str, error: &BackendError) {
+    tracing::warn!(
+        target: "praxis_ai::token_rate_limit::accounting",
+        phase = operation,
+        rule = rule.name,
+        algorithm = rule.backend.algorithm_name(),
+        backend = rule.backend.backend_name(),
+        result = "failed",
+        error = %error,
+        "token rate limit accounting"
+    );
+}
+
+/// Attach the bounded admission decision to this request's trace.
+#[cfg(feature = "opentelemetry")]
+fn record_admission_span(ctx: &mut HttpFilterContext<'_>, rule: &CompiledRule, estimate: u64, decision: &'static str) {
+    ctx.extensions.insert(crate::opentelemetry::token_rate_limit_span(
+        &rule.name,
+        rule.backend.algorithm_name(),
+        estimate,
+        decision,
+    ));
+}
+
+/// No-op when semantic tracing is not compiled in.
+#[cfg(not(feature = "opentelemetry"))]
+fn record_admission_span(
+    _ctx: &mut HttpFilterContext<'_>,
+    _rule: &CompiledRule,
+    _estimate: u64,
+    _decision: &'static str,
+) {
+}
+
+/// Complete the request span with actual cost when provider usage exists.
+#[cfg(feature = "opentelemetry")]
+fn record_actual_cost(ctx: &HttpFilterContext<'_>, actual: u64) {
+    if let Some(span) = ctx.extensions.get::<crate::opentelemetry::TokenRateLimitSpan>() {
+        span.record_actual(actual);
+    }
+}
+
+/// No-op when semantic tracing is not compiled in.
+#[cfg(not(feature = "opentelemetry"))]
+fn record_actual_cost(_ctx: &HttpFilterContext<'_>, _actual: u64) {}
 
 #[async_trait]
 impl HttpFilter for TokenRateLimitFilter {
@@ -1264,7 +1710,8 @@ impl HttpFilter for TokenRateLimitFilter {
         let Some(estimate) = estimate else {
             return Ok(FilterAction::Continue);
         };
-        let Some(key) = self.resolve_key_or_record_rejection(ctx, rule) else {
+        let Some(key) = self.resolve_key_or_record_rejection(ctx, rule, estimate) else {
+            record_admission_span(ctx, rule, estimate, "unauthenticated");
             return Ok(FilterAction::Reject(Rejection::status(401)));
         };
         let outcome = rule
@@ -1304,7 +1751,8 @@ impl HttpFilter for TokenRateLimitFilter {
             return Ok(FilterAction::Continue);
         };
 
-        let Some(key) = self.resolve_key_or_record_rejection(ctx, rule) else {
+        let Some(key) = self.resolve_key_or_record_rejection(ctx, rule, estimate) else {
+            record_admission_span(ctx, rule, estimate, "unauthenticated");
             return Ok(FilterAction::Reject(Rejection::status(401)));
         };
         let outcome = rule
@@ -1334,6 +1782,8 @@ impl HttpFilter for TokenRateLimitFilter {
             ctx.filter_metadata.remove(META_BUCKET_KEY);
             ctx.filter_metadata.remove(META_RULE_INDEX);
             ctx.filter_metadata.remove(META_ESTIMATE);
+            #[cfg(feature = "opentelemetry")]
+            ctx.extensions.remove::<crate::opentelemetry::TokenRateLimitSpan>();
         }
         Ok(FilterAction::Continue)
     }
@@ -1434,9 +1884,11 @@ mod backend_injection_tests {
     use super::{
         CompiledEstimation, CompiledRule, TokenRateLimitFilter,
         backend::{
-            BackendError, BackendReserve, BackendSettlement, ReconcileRequest, ReserveRequest,
+            BackendError, BackendReserve, BackendSettlement, BackendSnapshot, ReconcileRequest, ReserveRequest,
             TokenRateLimitStateBackend,
         },
+        record_backend_error_metric, record_request_metric, record_reserved_metric, record_settlement_metrics,
+        record_state_metrics, record_unauthenticated_metric,
     };
 
     /// A backend that admits every reservation but always fails to
@@ -1455,6 +1907,7 @@ mod backend_injection_tests {
             Ok(BackendReserve::Admitted {
                 reservation_id: 1,
                 estimate: 1,
+                usage_after: 1,
             })
         }
 
@@ -1469,6 +1922,35 @@ mod backend_injection_tests {
         fn limit(&self) -> u64 {
             1
         }
+
+        fn snapshot(&self) -> BackendSnapshot {
+            BackendSnapshot {
+                budget_remaining: 73,
+                active_reservations: 2,
+                active_keys: 3,
+            }
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "test"
+        }
+
+        fn algorithm_name(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    /// A fixed-estimate rule over [`EnqueueAlwaysFailsBackend`].
+    fn enqueue_always_fails_rule(name: &str) -> CompiledRule {
+        CompiledRule {
+            name: name.to_owned(),
+            matcher: None,
+            backend: std::sync::Arc::new(EnqueueAlwaysFailsBackend),
+            estimation: CompiledEstimation::Fixed { estimate: 1 },
+            weights: super::TokenWeights::UNITY,
+            tiers: Vec::new(),
+            inject_header_names: Vec::new(),
+        }
     }
 
     /// [`TokenRateLimitFilter::reconcile`] falls back to
@@ -1481,13 +1963,7 @@ mod backend_injection_tests {
     #[tokio::test]
     async fn reconcile_logs_rather_than_propagates_an_enqueue_reconcile_failure() {
         let filter = TokenRateLimitFilter {
-            rules: vec![CompiledRule {
-                name: "default".to_owned(),
-                matcher: None,
-                backend: std::sync::Arc::new(EnqueueAlwaysFailsBackend),
-                estimation: CompiledEstimation::Fixed { estimate: 1 },
-                weights: super::TokenWeights::UNITY,
-            }],
+            rules: vec![enqueue_always_fails_rule("default")],
             needs_body: false,
             key_source: super::KeySource::Global,
             epoch: std::time::Instant::now(),
@@ -1497,7 +1973,98 @@ mod backend_injection_tests {
         let mut ctx = crate::test_utils::make_filter_context(&req);
         drop(filter.on_request(&mut ctx).await.unwrap());
 
+        #[cfg(feature = "opentelemetry")]
+        assert!(
+            ctx.extensions
+                .get::<crate::opentelemetry::TokenRateLimitSpan>()
+                .is_some()
+        );
+
         let mut body = None;
         drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+        #[cfg(feature = "opentelemetry")]
+        assert!(
+            ctx.extensions
+                .get::<crate::opentelemetry::TokenRateLimitSpan>()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one contract test verifies every metric family's label keys together"
+    )]
+    fn prometheus_contract_emits_all_issue_883_metric_families_with_bounded_labels() {
+        let rule = enqueue_always_fails_rule("engineering");
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            record_request_metric(&rule.name, "admitted");
+            record_request_metric(&rule.name, "denied");
+            record_reserved_metric(&rule.name, 50);
+            record_settlement_metrics(
+                &rule.name,
+                &BackendSettlement::Applied {
+                    actual: 40,
+                    refund: 10,
+                    overage: 0,
+                },
+            );
+            record_state_metrics(&rule.name, rule.backend.as_ref());
+            record_backend_error_metric(&rule.name, rule.backend.backend_name());
+            record_unauthenticated_metric(&rule.name);
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let labels_for = |name: &str| {
+            snapshot
+                .iter()
+                .filter(|(key, ..)| key.key().name() == name)
+                .map(|(key, ..)| {
+                    let mut labels = key
+                        .key()
+                        .labels()
+                        .map(|label| label.key().to_owned())
+                        .collect::<Vec<_>>();
+                    labels.sort();
+                    labels
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            labels_for("praxis_trl_requests_total"),
+            vec![vec!["result".to_owned(), "rule".to_owned()]; 2]
+        );
+        for name in [
+            "praxis_trl_reservations_total",
+            "praxis_trl_tokens_reserved_total",
+            "praxis_trl_tokens_reconciled_total",
+            "praxis_trl_tokens_refunded_total",
+            "praxis_trl_tokens_overage_total",
+            "praxis_trl_reservations_active",
+            "praxis_trl_active_keys",
+            "praxis_trl_unauthenticated_total",
+        ] {
+            assert_eq!(
+                labels_for(name),
+                if name == "praxis_trl_reservations_total" {
+                    vec![vec!["result".to_owned(), "rule".to_owned()]]
+                } else {
+                    vec![vec!["rule".to_owned()]]
+                },
+                "wrong labels for {name}"
+            );
+        }
+        assert_eq!(
+            labels_for("praxis_trl_budget_remaining"),
+            vec![vec!["algorithm".to_owned(), "rule".to_owned()]]
+        );
+        assert_eq!(
+            labels_for("praxis_trl_backend_errors_total"),
+            vec![vec!["backend".to_owned(), "rule".to_owned()]]
+        );
     }
 }
