@@ -29,7 +29,9 @@ mod config;
 mod tests;
 
 use async_trait::async_trait;
-use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config};
+use praxis_filter::{
+    ErrorResponseFormatterHandle, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+};
 use tracing::debug;
 
 use self::config::{OperationClassifierConfig, ValidatedConfig, build_config};
@@ -150,9 +152,30 @@ impl HttpFilter for OpenaiOperationFilter {
         );
 
         publish_match(ctx, matched)?;
+        install_error_formatter(ctx, matched.application_protocol);
         self.set_routing_headers(ctx, matched);
 
         Ok(FilterAction::Continue)
+    }
+}
+
+/// Install the OpenAI error formatter for a matched OpenAI protocol.
+///
+/// Proxy-generated failures are returned in the shape the matched protocol's
+/// clients expect rather than as RFC 9457 problem details.
+///
+/// Keyed off the operation resolved from the request head, so it does not
+/// require a body, a successful parse, or any protocol-specific filter later
+/// in the chain. A Chat Completions request therefore keeps OpenAI-shaped
+/// errors without a Responses filter present, and a request whose body fails
+/// to parse still gets them.
+fn install_error_formatter(ctx: &mut HttpFilterContext<'_>, protocol: ApplicationProtocol) {
+    const OPENAI_PROTOCOLS: &[&str] = &["openai_responses", "openai_chat_completions", "openai_conversations"];
+
+    if OPENAI_PROTOCOLS.contains(&protocol.as_str()) {
+        ctx.extensions.insert(ErrorResponseFormatterHandle::new(
+            crate::openai::error_response_formatter::OpenAiErrorFormatter,
+        ));
     }
 }
 
