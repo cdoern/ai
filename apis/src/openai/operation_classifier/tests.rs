@@ -207,6 +207,10 @@ async fn websocket_handshake_on_conversations_is_not_classified() {
 /// The error formatter is installed from the request head, so an OpenAI
 /// client keeps OpenAI-shaped errors on proxy failures without any
 /// protocol-specific filter later in the chain.
+///
+/// Membership is derived from the protocol name, so a registry added later —
+/// Files and Vector Stores, for instance — is covered without touching this
+/// filter.
 #[tokio::test]
 async fn an_openai_operation_installs_the_error_formatter() {
     for (method, path) in [

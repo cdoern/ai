@@ -170,9 +170,11 @@ impl HttpFilter for OpenaiOperationFilter {
 /// errors without a Responses filter present, and a request whose body fails
 /// to parse still gets them.
 fn install_error_formatter(ctx: &mut HttpFilterContext<'_>, protocol: ApplicationProtocol) {
-    const OPENAI_PROTOCOLS: &[&str] = &["openai_responses", "openai_chat_completions", "openai_conversations"];
-
-    if OPENAI_PROTOCOLS.contains(&protocol.as_str()) {
+    // Every OpenAI protocol shares one error schema, so membership is derived
+    // from the protocol name rather than an enumerated list that has to be
+    // extended whenever a registry is added. Anthropic Messages and any vendor
+    // protocol keep their own error shape.
+    if protocol.as_str().starts_with("openai_") {
         ctx.extensions.insert(ErrorResponseFormatterHandle::new(
             crate::openai::error_response_formatter::OpenAiErrorFormatter,
         ));
