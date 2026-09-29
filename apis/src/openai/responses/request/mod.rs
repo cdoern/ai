@@ -49,7 +49,7 @@ use super::{
     config::{ResponsesFormatConfig, build_config},
     error::responses_error_rejection_with_code,
     extract_conversation_id,
-    routes::{self as responses_routes},
+    routes::{self as responses_routes, ResponsesOperation},
     state::ResponsesState,
 };
 use crate::{
@@ -128,7 +128,7 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let Some(body_shape) = matched_request_body(ctx) else {
+        let Some(matched) = matched_body_bearing_operation(ctx) else {
             trace!(
                 method = %ctx.request.method,
                 path = ctx.request.uri.path(),
@@ -140,12 +140,12 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         // An operation whose body the specification marks optional is complete
         // without one, so an absent body is not an invalid body and must not
         // reach `on_invalid`.
-        if !body_shape.is_required() && body.as_deref().is_none_or(<[u8]>::is_empty) {
+        if !matched.body.is_required() && body.as_deref().is_none_or(<[u8]>::is_empty) {
             trace!(
                 path = ctx.request.uri.path(),
-                "optional request body absent, nothing to parse"
+                "optional request body absent, publishing operation identity only"
             );
-            return Ok(FilterAction::Release);
+            return publish_bodyless_operation(ctx, &self.config);
         }
 
         // The one parse feeds classification, promotion, and state alike. A body
@@ -163,7 +163,7 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             return Ok(action);
         }
 
-        publish_request_facts(ctx, &classified, parsed, &self.config)?;
+        publish_request_facts(ctx, &classified, parsed, &self.config, matched.operation)?;
 
         Ok(FilterAction::Release)
     }
@@ -186,6 +186,7 @@ fn publish_request_facts(
     classified: &ClassifiedRequest,
     parsed: serde_json::Value,
     config: &ResponsesFormatConfig,
+    operation: ResponsesOperation,
 ) -> Result<(), FilterError> {
     let mode = super::compute_mode(classified);
 
@@ -206,6 +207,19 @@ fn publish_request_facts(
         return Ok(());
     }
 
+    // `ResponsesState` describes a response being created — it carries the
+    // conversation, the generated identifier, and the MCP approval state the
+    // agentic loop acts on. Compact and input-token-count are not creating a
+    // response, so giving them that state lets downstream filters read a
+    // token-count request as an approval submission.
+    if operation != ResponsesOperation::CreateResponse {
+        trace!(
+            operation = ?operation,
+            "body-bearing operation that does not create a response, leaving state uninitialized"
+        );
+        return Ok(());
+    }
+
     let response_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
     let conversation_id = resolve_conversation_id(ctx, &parsed);
 
@@ -220,6 +234,14 @@ fn publish_request_facts(
     );
 
     Ok(())
+}
+
+/// A matched Responses operation and its declared request-body shape.
+struct MatchedOperation {
+    /// Which Responses operation the request head resolved to.
+    operation: ResponsesOperation,
+    /// The body shape the registry declares for it.
+    body: RequestBody,
 }
 
 /// Publish the classification facts for one body.
@@ -303,10 +325,32 @@ fn classify_matched_operation(obj: &serde_json::Map<String, serde_json::Value>) 
 /// rather than a hand-written path list that can drift from it. Bodyless
 /// operations — fetch, delete, cancel, list input items, and the `WebSocket`
 /// handshake — yield `None` and are released untouched.
-fn matched_request_body(ctx: &HttpFilterContext<'_>) -> Option<RequestBody> {
+fn matched_body_bearing_operation(ctx: &HttpFilterContext<'_>) -> Option<MatchedOperation> {
     responses_routes::match_route(ctx.request.method.as_str(), ctx.request.uri.path(), Transport::Http)
-        .map(|route| route.spec.request_body())
-        .filter(|shape| shape.is_present())
+        .map(|route| MatchedOperation {
+            operation: route.spec.operation,
+            body: route.spec.request_body(),
+        })
+        .filter(|matched| matched.body.is_present())
+}
+
+/// Publish the operation's identity when it carries no body to parse.
+///
+/// The endpoint is authoritative that this is a Responses request even with
+/// nothing to classify, so the configured format header is still promoted and
+/// header-based routing can see the request. There are no body-derived facts,
+/// no routing mode, and no state.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when a filter result cannot be published.
+fn publish_bodyless_operation(
+    ctx: &mut HttpFilterContext<'_>,
+    config: &ResponsesFormatConfig,
+) -> Result<FilterAction, FilterError> {
+    let classified = empty_result(AiRequestFormat::Responses);
+    publish_classification(ctx, &classified, config, None)?;
+    Ok(FilterAction::Release)
 }
 
 /// Parse a create body once and extract its routing facts.

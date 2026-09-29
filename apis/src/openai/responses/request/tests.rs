@@ -265,9 +265,12 @@ async fn an_absent_optional_body_is_not_an_invalid_body() {
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
         assert!(matches!(action, FilterAction::Release), "{path} should forward");
-        assert!(
-            !ctx.filter_metadata.contains_key("openai_responses_format.format"),
-            "{path} has nothing to classify, so nothing is published"
+        assert_eq!(
+            ctx.filter_metadata
+                .get("openai_responses_format.format")
+                .map(String::as_str),
+            Some("openai_responses"),
+            "{path} still publishes its identity so header routing can see it"
         );
         assert!(
             ctx.extensions.get::<ResponsesState>().is_none(),
@@ -332,8 +335,9 @@ async fn other_body_bearing_responses_operations_are_processed() {
             "{path} should publish its classification"
         );
         assert!(
-            ctx.extensions.get::<ResponsesState>().is_some(),
-            "{path} carries a body, so state is initialized as the validator did"
+            ctx.extensions.get::<ResponsesState>().is_none(),
+            "{path} is not creating a response, so it must not get create state — \
+             the agentic loop reads the MCP approval state that carries"
         );
     }
 }
