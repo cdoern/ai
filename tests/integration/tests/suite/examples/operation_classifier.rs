@@ -120,12 +120,29 @@ fn a_chat_completions_failure_keeps_the_openai_error_shape() {
     let body = parse_body(&raw);
     let parsed: serde_json::Value =
         serde_json::from_str(&body).unwrap_or_else(|e| panic!("error body should be JSON: {e}\n{body}"));
+
+    // Assert the shape an OpenAI client actually parses, not merely that some
+    // `error` key exists: `{"error": null}` would satisfy a presence check.
+    let error = parsed
+        .get("error")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or_else(|| panic!("error must be an object, got: {body}"));
     assert!(
-        parsed.get("error").is_some(),
-        "an OpenAI client must receive the OpenAI error schema, got: {body}"
+        error.get("message").and_then(serde_json::Value::as_str).is_some(),
+        "error.message must be a string, got: {body}"
+    );
+    assert_eq!(
+        error.get("type").and_then(serde_json::Value::as_str),
+        Some("server_error"),
+        "error.type should classify an upstream failure, got: {body}"
+    );
+    assert_eq!(
+        error.get("code").and_then(serde_json::Value::as_str),
+        Some("upstream_connect_refused"),
+        "error.code should name the upstream failure, got: {body}"
     );
     assert!(
-        !body.contains("\"type\":\"about:blank\"") && !body.contains("problem+json"),
+        !body.contains("problem+json") && !body.contains("about:blank"),
         "must not fall back to RFC 9457 problem details, got: {body}"
     );
 }
