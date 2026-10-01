@@ -26,6 +26,25 @@ fn req(method: &str, path: &str) -> Request {
     make_request(http::Method::from_bytes(method.as_bytes()).unwrap(), path)
 }
 
+/// Classify one request and assert its published protocol and operation.
+async fn assert_family(method: &str, path: &str, protocol: &'static str, operation_id: &str) {
+    let filter = default_filter();
+    let request = req(method, path);
+    let mut ctx = make_filter_context(&request);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied();
+    assert!(matched.is_some(), "{method} {path} should classify");
+    let matched = matched.unwrap();
+    assert_eq!(
+        matched.application_protocol,
+        ApplicationProtocol::new(protocol),
+        "{method} {path}"
+    );
+    assert_eq!(matched.operation_id, operation_id, "{method} {path}");
+}
+
 /// `WebSocket` opening handshake headers.
 fn websocket_headers() -> http::HeaderMap {
     let mut headers = http::HeaderMap::new();
@@ -202,6 +221,55 @@ async fn websocket_handshake_on_conversations_is_not_classified() {
         ctx.extensions.get::<OpenAiOperationMatch>().is_none(),
         "Conversations is HTTP-only, so its route must not bypass transport classification on upgrade"
     );
+}
+
+/// Files publishes through the shared classifier, so a chain can branch on a
+/// proxy-owned fact instead of a path prefix.
+#[tokio::test]
+async fn classifies_files_operations() {
+    for (method, path, operation_id) in [
+        ("GET", "/v1/files", "listFiles"),
+        ("POST", "/v1/files", "createFile"),
+        ("GET", "/v1/files/file_abc/content", "downloadFile"),
+    ] {
+        assert_family(method, path, "openai_files", operation_id).await;
+    }
+}
+
+/// Vector Stores nests three levels deep and reuses `{file_id}` beneath a
+/// store, so each template has to resolve to its own operation.
+#[tokio::test]
+async fn classifies_vector_stores_operations() {
+    for (method, path, operation_id) in [
+        ("POST", "/v1/vector_stores", "createVectorStore"),
+        ("GET", "/v1/vector_stores/vs_1/files/file_1", "getVectorStoreFile"),
+        ("POST", "/v1/vector_stores/vs_1/search", "searchVectorStore"),
+        (
+            "GET",
+            "/v1/vector_stores/vs_1/file_batches/b_1/files",
+            "listFilesInVectorStoreBatch",
+        ),
+    ] {
+        assert_family(method, path, "openai_vector_stores", operation_id).await;
+    }
+}
+
+/// An unsupported method on a family path publishes nothing, so it cannot
+/// enter a route keyed on the classifier's output.
+#[tokio::test]
+async fn unsupported_family_methods_publish_no_match() {
+    for (method, path) in [("PUT", "/v1/files"), ("DELETE", "/v1/vector_stores")] {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        assert!(
+            ctx.extensions.get::<OpenAiOperationMatch>().is_none(),
+            "{method} {path} must not classify"
+        );
+    }
 }
 
 #[tokio::test]

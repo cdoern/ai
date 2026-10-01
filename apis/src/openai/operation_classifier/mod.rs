@@ -36,7 +36,8 @@ use self::config::{OperationClassifierConfig, ValidatedConfig, build_config};
 use crate::{
     openai::{
         chat_completions::routes as chat_completions_routes, conversations::routes as conversations_routes,
-        operation::OpenAiOperationSpec, responses::routes as responses_routes,
+        files::routes as files_routes, operation::OpenAiOperationSpec, responses::routes as responses_routes,
+        vector_stores::routes as vector_stores_routes,
     },
     operation::{ApplicationProtocol, PathParameterOffsets, RequestBody, RouteParams, Transport},
 };
@@ -186,8 +187,12 @@ fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: OpenAiOperationMatch)
 /// matched separately because transport is part of its operation identity.
 /// Path spaces do not overlap, so at most one match can succeed.
 pub(crate) fn classify(method: &str, path: &str, transport: Transport) -> Option<OpenAiOperationMatch> {
-    let http_match = (transport == Transport::Http)
-        .then(|| classify_conversation(method, path).or_else(|| classify_chat_completions(method, path)));
+    let http_match = (transport == Transport::Http).then(|| {
+        classify_conversation(method, path)
+            .or_else(|| classify_chat_completions(method, path))
+            .or_else(|| classify_files(method, path))
+            .or_else(|| classify_vector_stores(method, path))
+    });
     http_match
         .flatten()
         .or_else(|| classify_responses(method, path, transport))
@@ -204,6 +209,17 @@ fn classify_conversation(method: &str, path: &str) -> Option<OpenAiOperationMatc
 /// Match one Chat Completions operation.
 fn classify_chat_completions(method: &str, path: &str) -> Option<OpenAiOperationMatch> {
     chat_completions_routes::match_route(method, path)
+        .and_then(|route| classified(&route.spec.definition, route.params, path))
+}
+
+/// Match one Files operation.
+fn classify_files(method: &str, path: &str) -> Option<OpenAiOperationMatch> {
+    files_routes::match_route(method, path).and_then(|route| classified(&route.spec.definition, route.params, path))
+}
+
+/// Match one Vector Stores operation.
+fn classify_vector_stores(method: &str, path: &str) -> Option<OpenAiOperationMatch> {
+    vector_stores_routes::match_route(method, path)
         .and_then(|route| classified(&route.spec.definition, route.params, path))
 }
 

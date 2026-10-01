@@ -12,6 +12,7 @@ pub(crate) mod api_client;
 pub(crate) mod chat_completions;
 pub(crate) mod conversations;
 pub(crate) mod error_response_formatter;
+pub(crate) mod files;
 #[cfg(feature = "store")]
 pub(crate) mod include;
 mod operation;
@@ -24,6 +25,7 @@ pub(crate) mod sse;
     reason = "Responses translation helpers are wired into the HTTP filter in a later stack entry"
 )]
 pub(crate) mod translation;
+pub(crate) mod vector_stores;
 
 pub use chat_completions::routes::{
     ChatCompletionsOperation, ChatCompletionsOperationSpec, operation_specs as chat_completions_operation_specs,
@@ -33,6 +35,7 @@ pub use conversations::{
 };
 #[cfg(feature = "openai-conversations")]
 pub use conversations::{OpenaiConversationsFilter, implementation_openapi_json as conversations_openapi_json};
+pub use files::routes::{FilesOperation, FilesOperationSpec, operation_specs as files_operation_specs};
 pub use operation::OpenAiOperationSpec;
 pub use operation_classifier::{OpenAiOperationMatch, OpenaiOperationFilter};
 #[cfg(feature = "openai-compact")]
@@ -58,6 +61,9 @@ pub use responses::{
 };
 #[cfg(feature = "store")]
 pub use responses::{RehydrateFilter, ResponseStoreFilter};
+pub use vector_stores::routes::{
+    VectorStoresOperation, VectorStoresOperationSpec, operation_specs as vector_stores_operation_specs,
+};
 
 #[cfg(feature = "openai-mcp-tools")]
 pub use crate::mcp_client::McpStreamingSelectorFilter;
