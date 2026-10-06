@@ -178,7 +178,13 @@ filter_chains:
   - name: main
     filters:
       - filter: openai_responses_format
-      - filter: openai_responses_validate
+      - filter: openai_responses_request
+        on_invalid: reject
+        headers:
+          format: ~
+          model: ~
+          stream: ~
+          mode: ~
       - filter: router
         routes:
           - path_prefix: "/"
