@@ -170,15 +170,28 @@ impl HttpFilter for AiOperationFilter {
 /// in the chain. A Chat Completions request therefore keeps OpenAI-shaped
 /// errors without a Responses filter present, and a request whose body fails
 /// to parse still gets them.
+///
+/// The head is the only place this can be decided for a bodyless operation.
+/// `GET /v1/messages/batches/{id}` carries nothing to classify, so a
+/// body-format filter can never install its formatter; without this, an
+/// unreachable upstream would answer an Anthropic client with RFC 9457 problem
+/// details.
+///
+/// Each protocol family is matched by its identifier prefix rather than an
+/// enumerated list, so adding a registry to an existing family needs no change
+/// here. A vendor protocol that shares neither prefix keeps the default shape.
 fn install_error_formatter(ctx: &mut HttpFilterContext<'_>, protocol: ApplicationProtocol) {
-    // Every OpenAI protocol shares one error schema, so membership is derived
-    // from the protocol name rather than an enumerated list that has to be
-    // extended whenever a registry is added. Anthropic Messages and any vendor
-    // protocol keep their own error shape.
     if protocol.as_str().starts_with("openai_") {
         ctx.extensions.insert(ErrorResponseFormatterHandle::new(
             crate::openai::error_response_formatter::OpenAiErrorFormatter,
         ));
+    } else if protocol.as_str().starts_with("anthropic_") {
+        // Built before the insert so the immutable borrow of the request head
+        // ends before `extensions` is borrowed mutably.
+        let formatter = crate::anthropic::error_response_formatter::AnthropicErrorFormatter::from_request_headers(
+            &ctx.request.headers,
+        );
+        ctx.extensions.insert(ErrorResponseFormatterHandle::new(formatter));
     }
 }
 

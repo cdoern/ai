@@ -663,21 +663,63 @@ async fn one_filter_classifies_both_protocol_families() {
     .await;
 }
 
+/// Anthropic operations get the Anthropic error formatter from the head.
+///
+/// A bodyless operation such as `GET /v1/messages/batches/{id}` carries nothing
+/// for a body-format filter to classify, so the head is the only place this can
+/// be decided. Without it an unreachable upstream would answer an Anthropic
+/// client with RFC 9457 problem details.
 #[tokio::test]
-async fn an_anthropic_operation_keeps_its_own_error_shape() {
-    let filter = default_filter();
-    let request = req("POST", "/v1/messages");
-    let mut ctx = make_filter_context(&request);
+async fn anthropic_operations_install_the_anthropic_error_formatter() {
+    for (method, path) in [
+        ("POST", "/v1/messages"),
+        ("GET", "/v1/messages/batches"),
+        ("GET", "/v1/messages/batches/msgbatch_1"),
+        ("POST", "/v1/messages/batches/msgbatch_1/cancel"),
+    ] {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
 
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        assert!(
+            ctx.extensions.get::<AiOperationMatch>().is_some(),
+            "{method} {path} must classify"
+        );
+        assert!(
+            ctx.extensions.get::<ErrorResponseFormatterHandle>().is_some(),
+            "{method} {path} should install the Anthropic error formatter"
+        );
+    }
+}
+
+/// The installed formatter produces the Anthropic envelope, not the OpenAI one.
+#[tokio::test]
+async fn an_anthropic_failure_body_uses_the_anthropic_envelope() {
+    let filter = default_filter();
+    let request = req("GET", "/v1/messages/batches/msgbatch_1");
+    let mut ctx = make_filter_context(&request);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
+    let handle = ctx
+        .extensions
+        .get::<ErrorResponseFormatterHandle>()
+        .expect("a bodyless Anthropic operation must still install a formatter");
+    let context = praxis_filter::ErrorResponseContext::new("upstream_error", "upstream unavailable", 502);
+    let body = handle.format(&context);
+    let parsed: serde_json::Value = serde_json::from_slice(body.body.as_ref()).expect("the formatter must emit JSON");
+
+    assert_eq!(parsed.get("type").and_then(serde_json::Value::as_str), Some("error"));
+    let error = parsed
+        .get("error")
+        .and_then(serde_json::Value::as_object)
+        .expect("error object");
+    assert!(error.get("type").and_then(serde_json::Value::as_str).is_some());
+    assert!(error.get("message").and_then(serde_json::Value::as_str).is_some());
     assert!(
-        ctx.extensions.get::<AiOperationMatch>().is_some(),
-        "the Anthropic operation must still be classified"
-    );
-    assert!(
-        ctx.extensions.get::<ErrorResponseFormatterHandle>().is_none(),
-        "Anthropic keeps its own error shape rather than the OpenAI schema"
+        parsed.get("request_id").and_then(serde_json::Value::as_str).is_some(),
+        "the Anthropic envelope carries a request_id"
     );
 }
 
