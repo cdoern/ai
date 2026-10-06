@@ -17,11 +17,31 @@
 //! verbatim from that document, including upstream's `snake_case` operation IDs.
 //!
 //! Scope is the non-beta `/v1/messages` surface, matching the scope
-//! `docs/conformance/README.md` already declares for Anthropic review. Paths
-//! carrying a `?beta=true` query and the other Anthropic surfaces
-//! (`/v1/complete`, `/v1/models`, `/v1/files`, and the platform APIs) are
-//! deliberately absent: Praxis does not handle them, so they must publish no
-//! operation match.
+//! `docs/conformance/README.md` already declares for Anthropic review. The
+//! other Anthropic surfaces (`/v1/complete`, `/v1/models`, `/v1/files`, and the
+//! platform APIs) are deliberately absent: Praxis does not handle them, so they
+//! publish no operation match.
+//!
+//! # Beta variants are a header concern, not a path
+//!
+//! The pinned document lists each beta variant under a path key suffixed
+//! `?beta=true` — for example `GET /v1/messages/batches?beta=true` with
+//! operation ID `beta_message_batches_list`. That suffix is a key the
+//! mock-server document uses to keep both variants distinct within one
+//! `OpenAPI` file; it is not a request parameter. Neither variant declares a
+//! `beta` query parameter: they differ by the `anthropic-beta` request header.
+//!
+//! So no real request path carries `?beta=true`, and registering such entries
+//! would both encode that artifact and still miss real beta traffic, which
+//! arrives on the non-beta path with a header. The beta operation IDs are
+//! therefore not registered, and beta selection is not part of operation
+//! identity — the same treatment `anthropic-version` already gets.
+//!
+//! One consequence is worth stating plainly: because query strings do not
+//! affect matching, a request to `/v1/messages/batches?beta=true` resolves to
+//! `message_batches_list`, the non-beta operation its method and path name.
+//! Distinguishing beta behavior is left to Anthropic request processing and the
+//! backend, which can read the header.
 //!
 //! That document is a pinned reference, not a wired conformance gate — there is
 //! no `oasdiff` or capability projection for Anthropic, so this registry makes
@@ -367,8 +387,8 @@ mod tests {
         for path in [
             "/v1/messages",
             "/v1/messages/",
-            "/v1/messages?beta=true",
-            "/v1/messages/?beta=true",
+            "/v1/messages?stream=true",
+            "/v1/messages/?stream=true",
         ] {
             let matched = match_route("POST", path).unwrap();
             assert_eq!(
@@ -377,6 +397,35 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// A `?beta=true` query resolves to the non-beta operation.
+    ///
+    /// The pinned document uses that suffix as a path key to separate beta
+    /// variants, not as a request parameter — the variants differ by the
+    /// `anthropic-beta` header. Query strings do not affect matching, so such a
+    /// request resolves to the operation its method and path name. Asserted
+    /// rather than left implicit because the pinned document's path keys invite
+    /// the opposite assumption.
+    #[test]
+    fn a_beta_query_resolves_to_the_non_beta_operation() {
+        let listed = match_route("GET", "/v1/messages/batches?beta=true").unwrap();
+        assert_eq!(listed.spec.operation, AnthropicMessagesOperation::ListMessageBatches);
+        assert_eq!(listed.spec.operation_id(), "message_batches_list");
+
+        let created = match_route("POST", "/v1/messages?beta=true").unwrap();
+        assert_eq!(created.spec.operation_id(), "messages_post");
+    }
+
+    /// No beta operation ID from the pinned document is registered.
+    #[test]
+    fn beta_operation_ids_are_not_registered() {
+        assert!(
+            OPERATION_SPECS
+                .iter()
+                .all(|spec| !spec.operation_id().starts_with("beta_")),
+            "beta variants are selected by header, so they are not separate registry entries"
+        );
     }
 
     #[test]
