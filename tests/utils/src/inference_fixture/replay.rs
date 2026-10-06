@@ -426,7 +426,6 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
             | "path_rewrite"
             | "openai_responses_format"
             | "openai_responses_request"
-            | "openai_responses_validate"
             | "openai_client_tool_compat"
             | "state_owner"
             | "openai_response_store"
