@@ -784,14 +784,14 @@ class TestOpenAIConversations:
             input="Hello",
         )
 
-        assert response.id == "resp_passthrough"
-        assert response.status == "completed"
+        assert response.id == "resp_passthrough", "the backend response must reach the client unaltered"
+        assert response.status == "completed", "the passthrough chain must not rewrite the response status"
 
         forwarded = _RecordingResponsesBackend.forwarded
         assert len(forwarded) == 1, "exactly one request should reach the backend"
-        assert forwarded[0]["path"] == "/v1/responses"
-        assert forwarded[0]["body"]["model"] == "gpt-4.1"
-        assert forwarded[0]["body"]["input"] == "Hello"
+        assert forwarded[0]["path"] == "/v1/responses", "the create path must be forwarded unchanged"
+        assert forwarded[0]["body"]["model"] == "gpt-4.1", "the forwarded body must preserve the requested model"
+        assert forwarded[0]["body"]["input"] == "Hello", "the forwarded body must preserve the request input"
 
     def test_chunked_response_is_retrievable_with_composed_filters(
         self, chunked_response_client
