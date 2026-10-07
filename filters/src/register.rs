@@ -294,6 +294,10 @@ fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: 
     );
     praxis_filter::register_filters!(
         @register registry,
+        http "anthropic_messages_request" => praxis_ai_apis::anthropic::AnthropicMessagesRequestFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
         http "anthropic_messages_protocol" => praxis_ai_apis::anthropic::AnthropicMessagesProtocolFilter::from_config
     );
     praxis_filter::register_filters!(
