@@ -1,0 +1,119 @@
+# Praxis -> OGX (local learning config)
+#
+# Minimal config that puts Praxis in front of a local OGX
+# instance. Everything is plain routing: no AI filters, so
+# there is nothing to misconfigure while you confirm the
+# basic wiring works.
+#
+# Layout:
+#   client -> 127.0.0.1:8080 (Praxis) -> 127.0.0.1:8321 (OGX)
+#
+# Run:
+#   cargo run -p praxis-ai-proxy -- -c ogx.yaml -t   # validate only
+#   cargo run -p praxis-ai-proxy -- -c ogx.yaml      # serve
+#   cargo run -p praxis-ai-proxy -- -c ogx.yaml -T   # dump effective config
+#
+# Verify:
+#   curl http://127.0.0.1:8080/v1/models
+#   curl http://127.0.0.1:8080/v1/vector_stores
+#
+# With debug logging (watch each filter decide):
+#   RUST_LOG=debug cargo run -p praxis-ai-proxy -- -c ogx.yaml
+#
+# No OGX handy? Fake one and watch the raw bytes Praxis sends:
+#   while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}' | nc -l 8321; done
+
+admin:
+  address: "127.0.0.1:9901"
+
+# Logging. log_overrides is per-module, which beats a blanket
+# RUST_LOG=debug that buries you in Pingora internals.
+# non_blocking: false flushes every line immediately, so nothing
+# is lost when you Ctrl-C.
+#
+# RUST_LOG still takes precedence if it is set, so unset it for
+# these to apply.
+runtime:
+  logging:
+    output: stdout
+    non_blocking: false
+  log_overrides:
+    praxis_ai_apis: debug # classification, Responses filters
+    praxis_ai_filters: debug # routing, credentials, token usage
+    praxis_filter: info # core pipeline; debug here is very loud
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [ogx]
+
+filter_chains:
+  - name: ogx
+    filters:
+      # Classify the request and promote the model name to an
+      # internal header. Harmless for non-Responses traffic
+      # because on_invalid: continue lets it pass through.
+      # Also required if you later add time_to_first_token,
+      # which reads the model metadata this sets.
+      - filter: openai_responses_format
+        on_invalid: continue
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+
+      # Split the OGX surfaces onto named clusters. They all
+      # point at the same address today, but naming them now
+      # means you can move one to a different backend later
+      # by editing only the cluster block.
+      #
+      # path_prefix uses Gateway API segment-boundary matching:
+      # /v1/vector_stores and /v1/vector_stores/vs_1/files match,
+      # /v1/vector_stores_extra does not.
+      - filter: router
+        routes:
+          - path_prefix: "/v1/vector_stores"
+            cluster: ogx-vector-stores
+          - path_prefix: "/v1/files"
+            cluster: ogx-files
+          - path_prefix: "/"
+            cluster: ogx-inference
+
+      - filter: load_balancer
+        clusters:
+          - name: ogx-vector-stores
+            endpoints: ["127.0.0.1:8321"]
+          - name: ogx-files
+            endpoints: ["127.0.0.1:8321"]
+          - name: ogx-inference
+            endpoints: ["127.0.0.1:8321"]
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends
+# ---------------------------------------------------------------
+# Step 2: the delegation hop
+#
+# Everything above is Praxis *forwarding* a request. A callout
+# filter is different: Praxis pauses mid-request and makes its
+# own HTTP call to OGX, then rewrites the body before the
+# request continues upstream.
+#
+# To try it, paste this block into the filter chain directly
+# after openai_responses_format, then POST a /v1/responses
+# request whose input contains a file_id.
+#
+#      - filter: openai_file_resolve
+#        files_api_url: "http://127.0.0.1:8321"
+#        # Required: the SSRF guard rejects private and loopback
+#        # callout targets unless you opt in explicitly.
+#        allow_private_files_api_url: true
+#        allow_pre_security_callout: true
+#        file_url: resolve
+#        forward_headers:
+#          - authorization
+#        on_missing: reject
+#        timeout_ms: 10000
+#
+# Point the netcat stub above at 8321 while this is enabled and
+# you will see the callout arrive as its own separate request,
+# with its own headers, distinct from the client's request.
+# ---------------------------------------------------------------

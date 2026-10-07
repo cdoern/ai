@@ -11,8 +11,8 @@ use super::*;
 use crate::{
     openai::sse::{SseFrame, SseFrameParser},
     store::{
-        ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord, ResponseRecord,
-        ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
+        ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
+        ResponseEventRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
     },
 };
 
@@ -1231,6 +1231,50 @@ fn replay_canonicalizes_defaulted_item_types_and_excludes_unknown_items() {
             json!({"id":"item-2","type":"item_reference"}),
             json!({"id":"msg-1","type":"message","role":"assistant","content":"answer"}),
         ]
+    );
+}
+
+#[test]
+fn rehydration_preserves_provider_compaction_provenance_only() {
+    let stored = vec![
+        json!({
+            "type": "compaction",
+            "id": "compact_local",
+            "encrypted_content": "local",
+            "_praxis_local_compaction": true
+        }),
+        json!({
+            "type": "compaction",
+            "id": "compact_legacy",
+            "encrypted_content": "legacy-local"
+        }),
+        json!({
+            "type": "compaction",
+            "id": "cmp_provider",
+            "encrypted_content": "provider-opaque-state"
+        }),
+    ];
+
+    let state = build_state(
+        json!({
+            "input": [{
+                "type": "compaction",
+                "id": "cmp_current",
+                "encrypted_content": "current-provider-state"
+            }]
+        }),
+        stored,
+        vec![],
+        None,
+    );
+    assert_eq!(
+        state.provider_compaction_ids,
+        HashSet::from(["cmp_current".to_owned(), "cmp_provider".to_owned()])
+    );
+    assert_eq!(state.messages[0]["id"], "compact_local");
+    assert!(
+        state.messages[0].get("_praxis_local_compaction").is_none(),
+        "private provenance must not be sent to the backend"
     );
 }
 
@@ -3570,6 +3614,36 @@ impl ResponseStore for MockStore {
     ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
         // Rehydration never issues approvals; this stub satisfies the trait.
         Ok(Vec::new())
+    }
+
+    async fn append_events(
+        &self,
+        _tenant_id: &StateOwner,
+        _response_id: &str,
+        _events: &[ResponseEventRecord],
+    ) -> Result<(), StoreError> {
+        // Rehydration never writes the event log; this stub satisfies the trait.
+        Ok(())
+    }
+
+    async fn list_events_after(
+        &self,
+        _tenant_id: &StateOwner,
+        _response_id: &str,
+        _after: Option<u64>,
+        _limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+        // Rehydration never replays the event log; this stub satisfies the trait.
+        Ok(Vec::new())
+    }
+
+    async fn event_log_status(
+        &self,
+        _tenant_id: &StateOwner,
+        _response_id: &str,
+    ) -> Result<EventLogStatus, StoreError> {
+        // Rehydration never inspects the event log; this stub satisfies the trait.
+        Ok(EventLogStatus::default())
     }
 
     async fn get_conversation(
