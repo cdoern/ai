@@ -92,7 +92,7 @@ filter_chains:
     filters:
       - filter: openai_responses_format
         on_invalid: continue
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
       - filter: router
         routes:
@@ -108,7 +108,7 @@ filter_chains:
     filters:
       - filter: openai_responses_format
         on_invalid: continue
-      - filter: anthropic_messages_format
+      - filter: anthropic_messages_request
         on_invalid: continue
       - filter: router
         routes:

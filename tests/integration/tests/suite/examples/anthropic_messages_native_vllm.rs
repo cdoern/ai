@@ -114,8 +114,7 @@ fn native_vllm_chain_is_native_passthrough_not_translation() {
         types,
         [
             "basic_auth",
-            "anthropic_messages_format",
-            "anthropic_validate",
+            "anthropic_messages_request",
             "anthropic_messages_protocol",
             "headers",
             "router",
@@ -146,20 +145,22 @@ fn native_vllm_chain_is_native_passthrough_not_translation() {
 }
 
 #[test]
-fn native_vllm_validate_is_scoped_to_messages() {
-    // `anthropic_validate` rejects bodyless requests, so it must be gated to
-    // `/v1/messages` — otherwise the bodyless `GET /v1/models` startup probe
-    // would be rejected with 400.
+fn native_vllm_request_processing_needs_no_path_condition() {
+    // The processor is keyed to the create-message operation, so the bodyless
+    // `GET /v1/models` startup probe is released untouched. The separate
+    // validator this replaced rejected bodyless requests and had to be gated to
+    // `/v1/messages` to avoid a 400 on that probe; carrying such a condition
+    // forward would now be redundant scoping that hides where the rule lives.
     let config = load_example_config(CONFIG, 29924, HashMap::from([("127.0.0.1:8000", 29925_u16)]));
-    let validate = config.filter_chains[0]
+    let processor = config.filter_chains[0]
         .filters
         .iter()
-        .find(|f| f.filter_type == "anthropic_validate")
-        .expect("chain should contain anthropic_validate");
+        .find(|f| f.filter_type == "anthropic_messages_request")
+        .expect("chain should contain anthropic_messages_request");
 
     assert!(
-        !validate.conditions.is_empty(),
-        "anthropic_validate must be gated by a path condition, not run unconditionally"
+        processor.conditions.is_empty(),
+        "the operation keys the processor, so no path condition should be needed"
     );
 }
 
@@ -224,7 +225,7 @@ fn native_vllm_routes_count_tokens_natively() {
 
 #[test]
 fn native_vllm_passes_bodyless_models_probe() {
-    // `GET /v1/models` carries no body; because `anthropic_validate` is scoped
+    // `GET /v1/models` carries no body; because `anthropic_messages_request` is scoped
     // to `/v1/messages`, the probe must route through to the backend unchanged
     // rather than being rejected for an empty body.
     let backend = start_uri_echo_backend();

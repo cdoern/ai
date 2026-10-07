@@ -44,7 +44,7 @@ async fn run_with<'a>(
     body: Option<&[u8]>,
 ) -> (FilterAction, HttpFilterContext<'a>) {
     let mut ctx = make_filter_context(request);
-    let mut bytes = body.map(|b| Bytes::copy_from_slice(b));
+    let mut bytes = body.map(Bytes::copy_from_slice);
     let action = filter.on_request_body(&mut ctx, &mut bytes, true).await.unwrap();
     (action, ctx)
 }
@@ -156,50 +156,76 @@ async fn installs_the_anthropic_error_formatter() {
 }
 
 // -----------------------------------------------------------------------------
-// Envelope rejection
+// Envelope handling
 // -----------------------------------------------------------------------------
 
+/// `on_invalid: reject` refuses every envelope violation.
+///
+/// This is the policy the separate validator applied unconditionally.
 #[tokio::test]
-async fn an_absent_body_is_rejected() {
-    let filter = default_filter();
+async fn a_rejecting_chain_refuses_every_bad_envelope() {
+    let filter = filter("on_invalid: reject\n");
     let request = create_request();
-    let (action, ctx) = run_with(filter.as_ref(), &request, None).await;
 
-    assert!(matches!(action, FilterAction::Reject(_)));
-    assert!(
-        ctx.extensions.get::<AnthropicMessagesState>().is_none(),
-        "a rejected request must not leave state behind"
-    );
+    for body in [
+        None,
+        Some(b"".as_slice()),
+        Some(b"{not json".as_slice()),
+        Some(b"[1,2,3]".as_slice()),
+        Some(b"\"text\"".as_slice()),
+        Some(b"42".as_slice()),
+    ] {
+        let (action, ctx) = run_with(filter.as_ref(), &request, body).await;
+        assert!(
+            matches!(action, FilterAction::Reject(_)),
+            "body {body:?} must be refused"
+        );
+        assert!(
+            ctx.extensions.get::<AnthropicMessagesState>().is_none(),
+            "a rejected request must not leave state behind"
+        );
+    }
 }
 
+/// `on_invalid: continue` forwards a bad envelope to the backend.
+///
+/// This is the policy the classifier applied, and chains that ran it without
+/// the validator depend on it: a malformed body reaches the backend rather than
+/// being refused at the gateway.
 #[tokio::test]
-async fn an_empty_body_is_rejected() {
-    let filter = default_filter();
+async fn a_continuing_chain_forwards_a_bad_envelope() {
+    let filter = filter("on_invalid: continue\n");
     let request = create_request();
-    let (action, _) = run_with(filter.as_ref(), &request, Some(b"")).await;
-    assert!(matches!(action, FilterAction::Reject(_)));
+
+    for body in [
+        None,
+        Some(b"".as_slice()),
+        Some(b"{not json".as_slice()),
+        Some(b"[1,2,3]".as_slice()),
+    ] {
+        let (action, ctx) = run_with(filter.as_ref(), &request, body).await;
+        assert!(
+            matches!(action, FilterAction::Release),
+            "body {body:?} must be forwarded"
+        );
+        assert!(
+            ctx.extensions.get::<AnthropicMessagesState>().is_none(),
+            "there is no canonical state to publish for an unusable body"
+        );
+        assert!(
+            ctx.extensions.get::<ErrorResponseFormatterHandle>().is_some(),
+            "the head identified Anthropic traffic, so the error shape still applies"
+        );
+    }
 }
 
+/// `continue` is the default, matching the classifier it replaced.
 #[tokio::test]
-async fn a_malformed_body_is_rejected() {
+async fn the_default_policy_forwards_a_bad_envelope() {
     let filter = default_filter();
     let request = create_request();
     let (action, _) = run_with(filter.as_ref(), &request, Some(b"{not json")).await;
-    assert!(matches!(action, FilterAction::Reject(_)));
-}
-
-#[tokio::test]
-async fn a_non_object_body_is_rejected() {
-    let filter = default_filter();
-    let request = create_request();
-    for body in [b"[1,2,3]".as_slice(), b"\"text\"".as_slice(), b"42".as_slice()] {
-        let (action, _) = run_with(filter.as_ref(), &request, Some(body)).await;
-        assert!(
-            matches!(action, FilterAction::Reject(_)),
-            "a top-level {} must be refused",
-            String::from_utf8_lossy(body)
-        );
-    }
+    assert!(matches!(action, FilterAction::Release));
 }
 
 // -----------------------------------------------------------------------------
@@ -302,14 +328,25 @@ async fn a_bodyless_operation_is_not_rejected_for_a_missing_body() {
     );
 }
 
+/// The endpoint is the authority on protocol, not the payload's field mix.
+///
+/// An ordinary Anthropic body carries `messages` and no Responses or
+/// Conversations markers, which the shared body classifier reads as Chat
+/// Completions. The head already said create-message, so the published format
+/// is Anthropic Messages regardless.
 #[tokio::test]
-async fn an_unexpected_payload_is_rejected_when_configured() {
+async fn the_endpoint_decides_the_published_format() {
     let filter = filter("on_invalid: reject\n");
     let request = create_request();
-    let body = serde_json::to_vec(&json!({"input": "hello", "model": "gpt-4.1"})).unwrap();
-    let (action, _) = run_with(filter.as_ref(), &request, Some(&body)).await;
+    let body = serde_json::to_vec(&anthropic_body()).unwrap();
+    let (action, ctx) = run_with(filter.as_ref(), &request, Some(&body)).await;
+
     assert!(
-        matches!(action, FilterAction::Reject(_)),
-        "on_invalid: reject refuses a payload that is not an Anthropic Messages body"
+        matches!(action, FilterAction::Release),
+        "an ordinary Anthropic body must not be refused by a rejecting chain"
+    );
+    assert_eq!(
+        ctx.get_metadata("anthropic_messages_request.format"),
+        Some("anthropic_messages")
     );
 }

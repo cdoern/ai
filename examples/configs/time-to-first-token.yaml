@@ -12,7 +12,7 @@
 # responses. Non-streaming and non-success responses pass through
 # without measurement.
 #
-# A format filter (openai_responses_format, anthropic_messages_format, or
+# A classifying filter (openai_responses_format, anthropic_messages_request, or
 # anthropic_messages_to_chat_completions) must run upstream to set model metadata in the request
 # path. Without one, all TTFT samples are labeled "unknown".
 

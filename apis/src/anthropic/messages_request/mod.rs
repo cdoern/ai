@@ -15,8 +15,8 @@
 //! and filter results, and [`AnthropicMessagesState`]. The forwarded bytes are
 //! left untouched; a later filter that transforms them does so explicitly.
 //!
-//! This replaces the `anthropic_messages_format` and `anthropic_validate` pair.
-//! Those two each read the same body independently, and the classifier inferred
+//! This filter owns that parse outright. The classifier and validator it
+//! replaced each read the same body independently, and the classifier inferred
 //! the protocol from body shape with an `anthropic-version` tiebreak — a
 //! heuristic the registry makes unnecessary.
 //!
@@ -101,7 +101,6 @@ pub struct AnthropicMessagesState {
 
 /// Processes an Anthropic create-message body once and publishes its facts.
 ///
-/// Replaces the `anthropic_messages_format` and `anthropic_validate` pair.
 /// The registry decides which operation this filter owns, so only
 /// `POST /v1/messages` is processed. Every other Anthropic Messages operation —
 /// token counting, the batch family — is released untouched, as is traffic on
@@ -116,6 +115,31 @@ pub struct AnthropicMessagesRequestFilter {
 }
 
 impl AnthropicMessagesRequestFilter {
+    /// Apply `on_invalid` to a body that fails the create-message envelope rules.
+    ///
+    /// The two filters this replaced disagreed here, and which answer applied
+    /// depended on whether a chain happened to include the validator: the
+    /// validator refused a malformed body outright, while the classifier with
+    /// `on_invalid: continue` forwarded it and let the backend decide. One
+    /// filter cannot do both implicitly, so `on_invalid` selects it — `reject`
+    /// for a gateway that refuses malformed payloads, `continue` for a chain
+    /// that forwards them unchanged.
+    fn handle_bad_envelope(&self, ctx: &mut HttpFilterContext<'_>, reason: &BadEnvelope) -> FilterAction {
+        match self.config.on_invalid {
+            OnInvalidBehavior::Reject | OnInvalidBehavior::Error => {
+                debug!(reason = reason.message(), "rejecting create-message envelope");
+                FilterAction::Reject(wire::invalid_request_rejection(reason.message()))
+            },
+            OnInvalidBehavior::Continue => {
+                // The head still identified Anthropic traffic, so the error
+                // shape is installed even though the payload is forwarded.
+                trace!(reason = reason.message(), "forwarding malformed create-message body");
+                install_error_formatter(ctx);
+                FilterAction::Release
+            },
+        }
+    }
+
     /// Create a filter from parsed YAML config.
     ///
     /// # Errors
@@ -167,45 +191,24 @@ impl HttpFilter for AnthropicMessagesRequestFilter {
             return Ok(FilterAction::Release);
         }
 
-        // The create-message body is required by the registry, so an absent or
-        // empty one is a client error rather than an unclassifiable body.
-        let Some(bytes) = body.as_deref().filter(|chunk| !chunk.is_empty()) else {
-            debug!("rejecting create-message request with no body");
-            return Ok(FilterAction::Reject(wire::invalid_request_rejection(
-                "request body is required",
-            )));
-        };
-
-        let parsed = match serde_json::from_slice::<serde_json::Value>(bytes) {
+        let parsed = match parse_envelope(body) {
             Ok(value) => value,
-            Err(error) => {
-                debug!(%error, "rejecting unparseable create-message body");
-                return Ok(FilterAction::Reject(wire::invalid_request_rejection(
-                    "request body is not valid JSON",
-                )));
-            },
+            Err(reason) => return Ok(self.handle_bad_envelope(ctx, &reason)),
         };
 
-        let Some(object) = parsed.as_object() else {
-            debug!("rejecting non-object create-message body");
-            return Ok(FilterAction::Reject(wire::invalid_request_rejection(
-                "request body is not a JSON object",
-            )));
-        };
+        // One parse feeds classification and state alike.
+        //
+        // The head already decided this is the Anthropic create-message
+        // operation, so the endpoint is the authority on protocol: the format
+        // is Anthropic Messages whatever the payload's field mix resembles. The
+        // classifier this replaced had to guess from body shape and break ties
+        // on `anthropic-version`, which labelled an ordinary Anthropic body —
+        // `messages` with no Responses or Conversations markers — as Chat
+        // Completions.
+        let mut classified = classify_object(parsed.as_object().unwrap_or(&EMPTY_OBJECT));
+        classified.format = AiRequestFormat::AnthropicMessages;
 
-        // One parse feeds classification and state alike. The head already
-        // decided the operation, so classification only describes the payload.
-        let classified = classify_object(object);
-
-        debug!(
-            format = classified.format.as_str(),
-            model = ?classified.model,
-            "processed anthropic create-message body"
-        );
-
-        if let Some(action) = handle_unexpected_format(classified.format, &self.config) {
-            return Ok(action);
-        }
+        debug!(model = ?classified.model, "processed anthropic create-message body");
 
         install_error_formatter(ctx);
         write_metadata(ctx, &classified);
@@ -245,23 +248,46 @@ fn install_error_formatter(ctx: &mut HttpFilterContext<'_>) {
     ctx.extensions.insert(ErrorResponseFormatterHandle::new(formatter));
 }
 
-/// Apply `on_invalid` to a matched body that describes another protocol.
-///
-/// The operation is Anthropic's whatever the payload says, so this governs
-/// payload shape only: a chain may forward an odd body to the backend, or
-/// refuse it at the gateway.
-fn handle_unexpected_format(format: AiRequestFormat, config: &AnthropicMessagesRequestConfig) -> Option<FilterAction> {
-    if format == AiRequestFormat::AnthropicMessages {
-        return None;
+/// An empty object, so classifying a forwarded malformed body has a
+/// well-defined input without allocating per request.
+static EMPTY_OBJECT: std::sync::LazyLock<serde_json::Map<String, serde_json::Value>> =
+    std::sync::LazyLock::new(serde_json::Map::new);
+
+/// Why a create-message envelope could not be accepted.
+enum BadEnvelope {
+    /// No body, or an empty one.
+    Missing,
+    /// Present but not parseable as JSON.
+    NotJson,
+    /// Valid JSON that is not a top-level object.
+    NotObject,
+}
+
+impl BadEnvelope {
+    /// Client-facing reason text.
+    const fn message(&self) -> &'static str {
+        match *self {
+            Self::Missing => "request body is required",
+            Self::NotJson => "request body is not valid JSON",
+            Self::NotObject => "request body is not a JSON object",
+        }
     }
-    match config.on_invalid {
-        OnInvalidBehavior::Continue => None,
-        OnInvalidBehavior::Reject | OnInvalidBehavior::Error => {
-            debug!(format = format.as_str(), "rejecting unexpected create-message payload");
-            Some(FilterAction::Reject(wire::invalid_request_rejection(
-                "request body is not an Anthropic Messages payload",
-            )))
-        },
+}
+
+/// Parse the create-message envelope, naming the first rule it breaks.
+fn parse_envelope(body: &Option<Bytes>) -> Result<serde_json::Value, BadEnvelope> {
+    let bytes = body
+        .as_deref()
+        .filter(|chunk| !chunk.is_empty())
+        .ok_or(BadEnvelope::Missing)?;
+    let parsed = serde_json::from_slice::<serde_json::Value>(bytes).map_err(|error| {
+        debug!(%error, "create-message body is not valid JSON");
+        BadEnvelope::NotJson
+    })?;
+    if parsed.is_object() {
+        Ok(parsed)
+    } else {
+        Err(BadEnvelope::NotObject)
     }
 }
 

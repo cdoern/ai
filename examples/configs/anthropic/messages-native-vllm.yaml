@@ -52,19 +52,14 @@ filter_chains:
           - username: gateway
             env_var: GATEWAY_AUTH_PASSWORD
 
-      # Classify the request as Anthropic Messages and promote facts to
-      # internal `x-praxis-ai-*` headers. `on_invalid: continue` lets
-      # non-message paths (health checks, model discovery) pass through.
-      - filter: anthropic_messages_format
+      # Process the create-message body once: validate the envelope and
+      # promote routing facts to internal `x-praxis-ai-*` headers. The
+      # operation comes from the request head, so bodyless probes such as
+      # `GET /v1/models` are released untouched and need no path condition.
+      # `on_invalid: continue` forwards a body that parses but describes
+      # another protocol.
+      - filter: anthropic_messages_request
         on_invalid: continue
-
-      # Validate only the message-bearing endpoints. Scoping to
-      # `/v1/messages` keeps bodyless probes such as `GET /v1/models`
-      # from being rejected for having an empty body.
-      - filter: anthropic_validate
-        conditions:
-          - when:
-              path_prefix: "/v1/messages"
 
       # Supply a default `anthropic-version` header for internal or
       # non-SDK callers that omit it. Real Claude Code always sends one,

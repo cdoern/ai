@@ -150,10 +150,12 @@ Provider-owned parameter combinations pass through unchanged.
 Offers both the pre-read and bound-upstream body phases, so a
 chain can defer it until a logical provider is bound.
 
-### `anthropic_messages_format`
+### `anthropic_messages_request`
 
-Classifies Anthropic Messages API requests and
-promotes format metadata.
+Owns the Anthropic create-message body. The Messages
+registry decides the operation from the request head, then
+the body is deserialized once for envelope validation,
+routing facts, and canonical state.
 
 ### `prompt_enrich`
 
