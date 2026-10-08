@@ -73,11 +73,6 @@ async fn processes_a_create_message_body_once() {
     assert_eq!(state.max_tokens, Some(1024));
     assert_eq!(state.stream, None);
     assert!(!state.has_tools);
-    assert_eq!(
-        state.request_body,
-        anthropic_body(),
-        "state carries the one parse so consumers need not re-read the bytes"
-    );
 }
 
 #[tokio::test]
@@ -277,7 +272,44 @@ async fn the_anthropic_version_header_does_not_decide_the_operation() {
     );
 }
 
-/// Other Anthropic Messages operations are released untouched.
+/// Every Anthropic Messages operation keeps the Anthropic error shape.
+///
+/// Token counting and the batch family carry no body for this filter to
+/// process, but they are supported endpoints and a shipped chain may hold no
+/// other formatter. Without this an upstream failure would answer an Anthropic
+/// client with RFC 9457 problem details.
+#[tokio::test]
+async fn every_messages_operation_installs_the_anthropic_error_formatter() {
+    let filter = default_filter();
+    for (method, path) in [
+        ("POST", "/v1/messages"),
+        ("POST", "/v1/messages/count_tokens"),
+        ("GET", "/v1/messages/batches"),
+        ("GET", "/v1/messages/batches/msgbatch_1"),
+        ("POST", "/v1/messages/batches/msgbatch_1/cancel"),
+    ] {
+        let request = make_request(http::Method::from_bytes(method.as_bytes()).unwrap(), path);
+        let (_, ctx) = run_with(filter.as_ref(), &request, Some(b"{}")).await;
+        assert!(
+            ctx.extensions.get::<ErrorResponseFormatterHandle>().is_some(),
+            "{method} {path} should keep the Anthropic error shape"
+        );
+    }
+}
+
+/// A path outside the Messages surface installs no formatter.
+#[tokio::test]
+async fn a_non_messages_path_installs_no_formatter() {
+    let filter = default_filter();
+    let request = make_request(http::Method::POST, "/v1/chat/completions");
+    let (_, ctx) = run_with(filter.as_ref(), &request, Some(b"{}")).await;
+    assert!(
+        ctx.extensions.get::<ErrorResponseFormatterHandle>().is_none(),
+        "this filter owns only the Anthropic Messages surface"
+    );
+}
+
+/// Other Anthropic Messages operations are released without body processing.
 #[tokio::test]
 async fn non_create_operations_are_released_without_processing() {
     let filter = default_filter();

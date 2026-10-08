@@ -16,7 +16,7 @@ see the [Praxis core filter reference][core-ref].
 | Filter | Description |
 |--------|-------------|
 | [`anthropic_messages_protocol`](anthropic_messages_protocol.md) | Normalizes Anthropic Messages protocol headers for native backends. |
-| [`anthropic_messages_request`](anthropic_messages_request.md) | Canonical state for one Anthropic create-message request. |
+| [`anthropic_messages_request`](anthropic_messages_request.md) | Processes an Anthropic create-message body once and publishes its facts. |
 | [`anthropic_messages_to_chat_completions`](anthropic_messages_to_chat_completions.md) | Transforms Anthropic Messages API requests to Chat Completions-compatible request bodies and transforms compatible responses back. The name refers to the Chat Completions wire shape, not the OpenAI Responses API; any Chat Completions-compatible backend is a valid target, not only OpenAI. |
 | [`anthropic_messages_to_chat_completions_stream`](anthropic_messages_to_chat_completions_stream.md) | Transforms streaming SSE responses between the Chat Completions and Anthropic Messages formats, processing each chunk as it arrives. |
 | [`anthropic_web_search`](anthropic_web_search.md) | Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop. |

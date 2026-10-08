@@ -10,8 +10,8 @@
 //! create-message operation, and an Anthropic-shaped body on another path is
 //! not.
 //!
-//! A matched body is deserialized exactly once, and that one parsed value
-//! produces every downstream fact: the routing metadata, the promoted headers
+//! A matched body is deserialized exactly once, and that one parse produces
+//! every fact this filter publishes: the routing metadata, the promoted headers
 //! and filter results, and [`AnthropicMessagesState`]. The forwarded bytes are
 //! left untouched; a later filter that transforms them does so explicitly.
 //!
@@ -74,41 +74,18 @@ use crate::{
 /// Filter name as configured in a pipeline.
 const FILTER_NAME: &str = "anthropic_messages_request";
 
-/// Canonical state for one Anthropic create-message request.
-///
-/// Stored in request extensions so translation, web search, and guardrail
-/// consumers read one parse rather than each deserializing the body again.
-#[derive(Clone, Debug)]
-pub struct AnthropicMessagesState {
-    /// The parsed create-message body.
-    ///
-    /// Held so message-extracting consumers do not re-parse the forwarded
-    /// bytes. The forwarded bytes themselves are never mutated here.
-    pub request_body: serde_json::Value,
-
-    /// Extracted `model`, when present.
-    pub model: Option<String>,
-
-    /// Extracted `stream`, when present.
-    pub stream: Option<bool>,
-
-    /// Extracted `max_tokens`, when present.
-    pub max_tokens: Option<u64>,
-
-    /// Whether `tools` is a non-empty array.
-    pub has_tools: bool,
-}
-
 /// Processes an Anthropic create-message body once and publishes its facts.
 ///
 /// The registry decides which operation this filter owns, so only
-/// `POST /v1/messages` is processed. Every other Anthropic Messages operation —
-/// token counting, the batch family — is released untouched, as is traffic on
-/// any other path.
+/// `POST /v1/messages` has its body processed. Every other Anthropic Messages
+/// operation — token counting, the batch family — is released without body
+/// work but still gets the Anthropic error shape, because those are supported
+/// endpoints and a chain may carry no other formatter. Traffic outside the
+/// Messages surface is left entirely alone.
 ///
-/// Rejects a missing, malformed, or non-object body with an
-/// Anthropic-compatible client error. `on_invalid` governs a body that parses
-/// but classifies as another protocol.
+/// `on_invalid` governs the envelope: a missing, malformed, or non-object body
+/// is refused with an Anthropic-compatible client error under `reject`, or
+/// forwarded for the backend to answer under `continue`.
 pub struct AnthropicMessagesRequestFilter {
     /// Parsed and validated configuration.
     config: AnthropicMessagesRequestConfig,
@@ -140,6 +117,35 @@ impl AnthropicMessagesRequestFilter {
         }
     }
 
+    /// Derive and publish every fact the one parse produced.
+    ///
+    /// The head already decided this is the create-message operation, so the
+    /// endpoint is the authority on protocol: the format is Anthropic Messages
+    /// whatever the payload's field mix resembles. The classifier this replaced
+    /// had to guess from body shape and break ties on `anthropic-version`, which
+    /// labelled an ordinary Anthropic body — `messages` with no Responses or
+    /// Conversations markers — as Chat Completions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] when a filter result cannot be published.
+    fn publish_create_message_facts(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        object: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), FilterError> {
+        let mut classified = classify_object(object);
+        classified.format = AiRequestFormat::AnthropicMessages;
+
+        debug!(model = ?classified.model, "processed anthropic create-message body");
+
+        write_metadata(ctx, &classified);
+        promote_headers(ctx, &classified, &self.config);
+        promote_filter_results(ctx, &classified)?;
+        insert_state(ctx, &classified);
+        Ok(())
+    }
+
     /// Create a filter from parsed YAML config.
     ///
     /// # Errors
@@ -150,6 +156,31 @@ impl AnthropicMessagesRequestFilter {
         let validated = build_config(cfg)?;
         Ok(Box::new(Self { config: validated }))
     }
+}
+
+/// Proxy-required facts extracted from one Anthropic create-message body.
+///
+/// Published as a typed extension beside the promoted metadata. Consumers read
+/// the metadata today, because it survives the iterative request/response loop
+/// where request extensions are rebuilt; this is the typed form of the same
+/// facts for anything running in the request phase.
+///
+/// The parsed body is deliberately not retained. Holding a whole JSON tree for
+/// every request would only pay off if a consumer read it instead of parsing
+/// the forwarded bytes, and none does.
+#[derive(Clone, Debug)]
+pub struct AnthropicMessagesState {
+    /// Extracted `model`, when present.
+    pub model: Option<String>,
+
+    /// Extracted `stream`, when present.
+    pub stream: Option<bool>,
+
+    /// Extracted `max_tokens`, when present.
+    pub max_tokens: Option<u64>,
+
+    /// Whether `tools` is a non-empty array.
+    pub has_tools: bool,
 }
 
 #[async_trait]
@@ -182,39 +213,37 @@ impl HttpFilter for AnthropicMessagesRequestFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if !is_create_message(ctx) {
+        let Some(operation) = matched_operation(ctx) else {
             trace!(
                 method = %ctx.request.method,
                 path = ctx.request.uri.path(),
-                "not the Anthropic create-message operation"
+                "not an Anthropic Messages operation"
+            );
+            return Ok(FilterAction::Release);
+        };
+
+        // Every Anthropic Messages operation gets the Anthropic error shape,
+        // not just the one whose body this filter processes. Token counting and
+        // the batch family are supported endpoints with no body work here, and
+        // the shipped native chain carries no other formatter — without this an
+        // upstream failure on `POST /v1/messages/count_tokens` would answer an
+        // Anthropic client with RFC 9457 problem details.
+        install_error_formatter(ctx);
+
+        if operation != AnthropicMessagesOperation::CreateMessage {
+            trace!(
+                path = ctx.request.uri.path(),
+                "Anthropic Messages operation that carries no body to process"
             );
             return Ok(FilterAction::Release);
         }
 
-        let parsed = match parse_envelope(body) {
-            Ok(value) => value,
+        let object = match parse_envelope(body) {
+            Ok(object) => object,
             Err(reason) => return Ok(self.handle_bad_envelope(ctx, &reason)),
         };
 
-        // One parse feeds classification and state alike.
-        //
-        // The head already decided this is the Anthropic create-message
-        // operation, so the endpoint is the authority on protocol: the format
-        // is Anthropic Messages whatever the payload's field mix resembles. The
-        // classifier this replaced had to guess from body shape and break ties
-        // on `anthropic-version`, which labelled an ordinary Anthropic body —
-        // `messages` with no Responses or Conversations markers — as Chat
-        // Completions.
-        let mut classified = classify_object(parsed.as_object().unwrap_or(&EMPTY_OBJECT));
-        classified.format = AiRequestFormat::AnthropicMessages;
-
-        debug!(model = ?classified.model, "processed anthropic create-message body");
-
-        install_error_formatter(ctx);
-        write_metadata(ctx, &classified);
-        promote_headers(ctx, &classified, &self.config);
-        promote_filter_results(ctx, &classified)?;
-        insert_state(ctx, parsed, &classified);
+        self.publish_create_message_facts(ctx, &object)?;
 
         Ok(FilterAction::Release)
     }
@@ -224,7 +253,7 @@ impl HttpFilter for AnthropicMessagesRequestFilter {
 // Helpers
 // -----------------------------------------------------------------------------
 
-/// Whether the request head resolves to the Anthropic create-message operation.
+/// The Anthropic Messages operation the request head resolves to, if any.
 ///
 /// The registry is consulted directly rather than through the published
 /// [`AiOperationMatch`] extension, because a head-phase extension is not visible
@@ -232,9 +261,8 @@ impl HttpFilter for AnthropicMessagesRequestFilter {
 /// identity is identical either way.
 ///
 /// [`AiOperationMatch`]: crate::operation_classifier::AiOperationMatch
-fn is_create_message(ctx: &HttpFilterContext<'_>) -> bool {
-    match_route(ctx.request.method.as_str(), ctx.request.uri.path())
-        .is_some_and(|route| route.spec.operation == AnthropicMessagesOperation::CreateMessage)
+fn matched_operation(ctx: &HttpFilterContext<'_>) -> Option<AnthropicMessagesOperation> {
+    match_route(ctx.request.method.as_str(), ctx.request.uri.path()).map(|route| route.spec.operation)
 }
 
 /// Install the Anthropic error response formatter.
@@ -247,11 +275,6 @@ fn install_error_formatter(ctx: &mut HttpFilterContext<'_>) {
         crate::anthropic::error_response_formatter::AnthropicErrorFormatter::from_request_headers(&ctx.request.headers);
     ctx.extensions.insert(ErrorResponseFormatterHandle::new(formatter));
 }
-
-/// An empty object, so classifying a forwarded malformed body has a
-/// well-defined input without allocating per request.
-static EMPTY_OBJECT: std::sync::LazyLock<serde_json::Map<String, serde_json::Value>> =
-    std::sync::LazyLock::new(serde_json::Map::new);
 
 /// Why a create-message envelope could not be accepted.
 enum BadEnvelope {
@@ -275,7 +298,10 @@ impl BadEnvelope {
 }
 
 /// Parse the create-message envelope, naming the first rule it breaks.
-fn parse_envelope(body: &Option<Bytes>) -> Result<serde_json::Value, BadEnvelope> {
+///
+/// Returns the object itself rather than a `Value`, so the caller cannot be
+/// handed a non-object and has nothing to unwrap.
+fn parse_envelope(body: &Option<Bytes>) -> Result<serde_json::Map<String, serde_json::Value>, BadEnvelope> {
     let bytes = body
         .as_deref()
         .filter(|chunk| !chunk.is_empty())
@@ -284,10 +310,9 @@ fn parse_envelope(body: &Option<Bytes>) -> Result<serde_json::Value, BadEnvelope
         debug!(%error, "create-message body is not valid JSON");
         BadEnvelope::NotJson
     })?;
-    if parsed.is_object() {
-        Ok(parsed)
-    } else {
-        Err(BadEnvelope::NotObject)
+    match parsed {
+        serde_json::Value::Object(object) => Ok(object),
+        _ => Err(BadEnvelope::NotObject),
     }
 }
 
@@ -371,10 +396,9 @@ fn promote_filter_results(ctx: &mut HttpFilterContext<'_>, classified: &Classifi
     Ok(())
 }
 
-/// Insert the canonical state derived from the one parse.
-fn insert_state(ctx: &mut HttpFilterContext<'_>, parsed: serde_json::Value, classified: &ClassifiedRequest) {
+/// Insert the typed facts derived from the one parse.
+fn insert_state(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest) {
     ctx.extensions.insert(AnthropicMessagesState {
-        request_body: parsed,
         model: classified.model.clone(),
         stream: classified.stream,
         max_tokens: classified.max_tokens,

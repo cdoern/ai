@@ -223,11 +223,50 @@ fn native_vllm_routes_count_tokens_natively() {
     );
 }
 
+/// A malformed create-message body is refused at the gateway, not forwarded.
+///
+/// The separate validator this chain used to carry rejected malformed bodies,
+/// and `on_invalid: reject` keeps that. Asserted against the backend rather than
+/// only the status, because forwarding a malformed body to a native Anthropic
+/// backend is the regression worth catching.
+#[test]
+fn native_vllm_rejects_a_malformed_create_message_body() {
+    let backend = start_uri_echo_backend();
+    let proxy_port = free_port();
+    let config = native_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &format!(
+            "POST /v1/messages HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             {}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 9\r\n\
+             Connection: close\r\n\r\n\
+             {{not json",
+            gateway_auth_line()
+        ),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "a malformed create-message body must be refused at the gateway: {raw}"
+    );
+    let body = parse_body(&raw);
+    assert!(
+        body.contains("\"type\":\"error\"") || body.contains("\"type\": \"error\""),
+        "the refusal must use the Anthropic error envelope: {body}"
+    );
+}
+
 #[test]
 fn native_vllm_passes_bodyless_models_probe() {
-    // `GET /v1/models` carries no body; because `anthropic_messages_request` is scoped
-    // to `/v1/messages`, the probe must route through to the backend unchanged
-    // rather than being rejected for an empty body.
+    // `GET /v1/models` carries no body. The processor is keyed to the
+    // create-message operation, so the probe routes through to the backend
+    // unchanged rather than being rejected for an empty body.
     let backend = start_uri_echo_backend();
     let proxy_port = free_port();
     let config = native_vllm_config(proxy_port, backend.port());

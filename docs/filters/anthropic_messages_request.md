@@ -3,11 +3,13 @@
 
 # `anthropic_messages_request`
 
-Canonical state for one Anthropic create-message request.
+Processes an Anthropic create-message body once and publishes its facts.
 
 ## Configuration Notes
 
-Stored in request extensions so translation, web search, and guardrail consumers read one parse rather than each deserializing the body again.
+The registry decides which operation this filter owns, so only `POST /v1/messages` has its body processed. Every other Anthropic Messages operation — token counting, the batch family — is released without body work but still gets the Anthropic error shape, because those are supported endpoints and a chain may carry no other formatter. Traffic outside the Messages surface is left entirely alone.
+
+`on_invalid` governs the envelope: a missing, malformed, or non-object body is refused with an Anthropic-compatible client error under `reject`, or forwarded for the backend to answer under `continue`.
 
 ## Configuration
 
