@@ -186,7 +186,7 @@ fn an_unsupported_family_method_falls_through() {
 /// A Chat Completions client keeps OpenAI-shaped errors when the proxy itself
 /// fails, without any Responses filter in the chain.
 ///
-/// This chain runs only the operation classifier — no `openai_responses_format`
+/// This chain runs only the operation classifier — no `openai_responses_request`
 /// — so it is the case that proves the error formatter follows head
 /// classification rather than body classification. Before that, a chain without
 /// a Responses filter returned RFC 9457 problem details to an OpenAI client.

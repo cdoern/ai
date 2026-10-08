@@ -725,7 +725,7 @@ fn request_needs_rehydrate_store(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request references a conversation.
 fn has_conversation(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.has_conversation") == Some("true")
+    ctx.get_metadata("openai_responses_request.has_conversation") == Some("true")
 }
 
 /// Return whether the request method is not persistable.
@@ -739,7 +739,7 @@ fn is_non_post_request(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request is not a Responses API request.
 fn is_non_responses_format(ctx: &HttpFilterContext<'_>) -> bool {
-    let format = ctx.get_metadata("openai_responses_format.format");
+    let format = ctx.get_metadata("openai_responses_request.format");
     let skip = !is_responses_format(ctx);
     if skip {
         trace!(format = ?format, "skipping non-responses format");
@@ -749,12 +749,12 @@ fn is_non_responses_format(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request is classified as a Responses API request.
 fn is_responses_format(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+    ctx.get_metadata("openai_responses_request.format") == Some("openai_responses")
 }
 
 /// Return whether the request explicitly disabled persistence.
 fn is_store_disabled(ctx: &HttpFilterContext<'_>) -> bool {
-    let skip = ctx.get_metadata("openai_responses_format.store") == Some("false");
+    let skip = ctx.get_metadata("openai_responses_request.store") == Some("false");
     if skip {
         trace!("skipping persistence (store=false)");
     }
@@ -763,7 +763,7 @@ fn is_store_disabled(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request uses streaming responses.
 fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.stream") == Some("true")
+    ctx.get_metadata("openai_responses_request.stream") == Some("true")
 }
 
 /// Return whether this is a streaming replay retrieval
@@ -798,7 +798,7 @@ fn streaming_terminal_emitted(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request references a previous response.
 fn has_previous_response_id(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.has_previous_response_id") == Some("true")
+    ctx.get_metadata("openai_responses_request.has_previous_response_id") == Some("true")
 }
 
 /// Check whether persistence was skipped during the response phase.
@@ -1165,7 +1165,7 @@ impl ResponseStoreFilter {
     /// GETs fall through to normal retrieval, and unrelated paths continue.
     async fn handle_get_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         // A replay GET returns a streaming SSE response. Force streaming
-        // response mode first: a legacy `openai_responses_format` pipeline
+        // response mode first: an `openai_responses_request` pipeline
         // classifies the GET as Responses-format with `stream=false` (the flag
         // is read from a POST body it never sees), which would otherwise select
         // the buffered override in `on_request` and make the runtime reject the
@@ -1327,33 +1327,19 @@ fn build_input_items_response(
 
 /// Serialize a successful input items page into a 200 JSON response.
 fn build_input_items_ok(id: &str, page: &InputItemPage) -> FilterAction {
-    let first_id = page.data.first().and_then(|v| v.get("id")).and_then(|v| v.as_str());
-    // Items normally carry a synthetic ID (see `normalize_input_items`),
-    // but non-object array entries can't be tagged with one. Fall back
-    // to the page's numeric cursor so `after`-based pagination stays
-    // usable even for that edge case, instead of exposing a `null`
-    // `last_id` clients have no way to resume from.
-    let last_id = page
-        .data
-        .last()
-        .and_then(|v| v.get("id"))
-        .and_then(|v| v.as_str())
-        .or(page.next_cursor.as_deref());
-
-    let body = serde_json::json!({
-        "object": "list",
-        "data": page.data,
-        "has_more": page.has_more,
-        "first_id": first_id,
-        "last_id": last_id,
-    });
     debug!(
         response_id = id,
         count = page.data.len(),
         has_more = page.has_more,
         "serving input items"
     );
-    let bytes = serde_json::to_vec(&body).unwrap_or_default();
+    let bytes = match serde_json::to_vec(page) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(response_id = id, error = %e, "input_items serialization failed");
+            return FilterAction::Reject(reject_store_error());
+        },
+    };
     FilterAction::Reject(
         Rejection::status(200)
             .with_header("content-type", "application/json")

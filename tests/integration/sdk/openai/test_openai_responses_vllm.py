@@ -24,6 +24,7 @@ Usage:
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import io
+from itertools import islice
 import json
 import os
 import signal
@@ -87,6 +88,7 @@ CLIENT_TOOL_COMPAT_CONFIG_PATH = (
 CLIENT_TOOL_COMPAT_CHAT_CONFIG_PATH = (
     "examples/configs/openai/responses/client-tool-compat-chat-completions.yaml"
 )
+TTFT_CONFIG_PATH = "examples/configs/time-to-first-token.yaml"
 
 TERMINAL_RESPONSE_EVENTS = {
     "response.cancelled",
@@ -329,6 +331,44 @@ def _write_full_flow_config(
 
     config = _patch_store_backend(config, db_path)
     return _persist_config(config)
+
+
+def _write_ttft_config(praxis_port: int, metrics_port: int, *, backend_endpoint: str) -> str:
+    """Patch the TTFT example to target the test backend and expose /metrics.
+
+    The shipped example forwards every path to one backend and records the
+    ``praxis_ai_ttft_seconds`` histogram. An ``admin`` listener is appended so the
+    test can scrape that histogram and confirm the model label
+    ``openai_chat_completions_request`` published for a native chat completion.
+    """
+    with open(TTFT_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3000", backend_endpoint)
+
+    admin_block = f'\nadmin:\n  address: "127.0.0.1:{metrics_port}"\n'
+    anchor = "\ninsecure_options:\n"
+    assert config.count(anchor) == 1, "TTFT example should declare insecure_options once"
+    config = config.replace(anchor, admin_block + anchor, 1)
+
+    return _persist_config(config)
+
+
+def _scrape_metrics(metrics_port: int) -> str:
+    """Fetch the Prometheus exposition text from the admin endpoint."""
+    response = httpx.get(f"http://127.0.0.1:{metrics_port}/metrics", timeout=5)
+    response.raise_for_status()
+    return response.text
+
+
+def _has_ttft_sample_for_model(metrics_text: str, model: str) -> bool:
+    """Whether the TTFT histogram carries a sample labeled with ``model``."""
+    label = f'model="{model}"'
+    return any(
+        line.startswith("praxis_ai_ttft_seconds") and label in line
+        for line in metrics_text.splitlines()
+    )
 
 
 def _read_log_tail(log_path: str, max_lines: int = 50) -> str:
@@ -1022,6 +1062,7 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
     def _send_conversation_response(self, request_body):
         """Serve native Responses without a model so append/hydration is deterministic."""
         request_input = json.dumps(request_body.get("input"))
+        leading_bom = "STREAM-LEADING-BOM-1546" in request_input
         local_tool_limit = "STREAM-LOCAL-DELETE-410" in request_input
         web_call_limit = "STREAM-WEB-LIMIT-410" in request_input
         tool_model = request_body["model"] == "sdk-conversation-tool-stream"
@@ -1088,11 +1129,20 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
                 {"type": "response.created", "sequence_number": 0, "response": created},
                 {"type": "response.completed", "sequence_number": 1, "response": response},
             ]
-            encoded_frames = [
-                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
-                for event in frames
-            ]
-            payload = b"".join(encoded_frames) + b"data: [DONE]\n\n"
+            if leading_bom:
+                encoded_frames = [
+                    f"data: {json.dumps(event)}\n\n".encode() for event in frames
+                ]
+            else:
+                encoded_frames = [
+                    f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+                    for event in frames
+                ]
+            payload = (
+                (b"\xef\xbb\xbf" if leading_bom else b"")
+                + b"".join(encoded_frames)
+                + b"data: [DONE]\n\n"
+            )
             content_type = "text/event-stream"
         else:
             payload = json.dumps(response).encode()
@@ -1509,6 +1559,47 @@ def praxis_proxy(tmp_path_factory, request, backend_endpoint):
                     f"\n=== Praxis logs ===\n{f.read()}",
                     file=sys.stderr,
                 )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def ttft_proxy(tmp_path_factory, request, backend_endpoint):
+    """Start a Praxis proxy on the TTFT example with the /metrics endpoint exposed.
+
+    Native ``POST /v1/chat/completions`` is forwarded straight to the backend, so
+    ``openai_chat_completions_request`` publishes the request model for the
+    ``time_to_first_token`` histogram. Yields the proxy and admin (metrics) ports.
+    """
+    port = _free_port()
+    metrics_port = _free_port()
+    log_dir = tmp_path_factory.mktemp("ttft")
+    config_path = _write_ttft_config(port, metrics_port, backend_endpoint=backend_endpoint)
+    binary = _find_binary()
+
+    log_path = str(log_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port, metrics_port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(f"\n=== TTFT proxy Praxis logs ===\n{f.read()}", file=sys.stderr)
         os.unlink(config_path)
 
 
@@ -2371,6 +2462,18 @@ class TestOpenAIResponsesVLLM:
         assert next_page.has_more is False
         assert "Repeat the marker" in next_page.data[0].content[0].text
 
+        desc_page = openai_client.responses.input_items.list(
+            response.id,
+            limit=1,
+            order="desc",
+        )
+        assert desc_page.object == "list"
+        assert len(desc_page.data) == 1
+        assert desc_page.first_id == desc_page.data[0].id
+        assert desc_page.last_id == desc_page.data[-1].id
+        assert desc_page.first_id == next_page.data[0].id
+        assert desc_page.has_more is True
+
         assert openai_client.responses.delete(response.id) is None
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.responses.retrieve(response.id)
@@ -2378,6 +2481,42 @@ class TestOpenAIResponsesVLLM:
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.responses.input_items.list(response.id)
         assert exc_info.value.status_code == 404
+
+    def test_duplicate_input_item_ids_auto_paginate(self, witness_backend_client):
+        client, _forwarded = witness_backend_client
+        response = client.responses.create(
+            model="sdk-conversation-stream",
+            input=[
+                {"type": "item_reference", "id": "dup"},
+                {"type": "item_reference", "id": "dup"},
+                {"type": "item_reference", "id": "c"},
+            ],
+            store=True,
+            max_output_tokens=16,
+        )
+
+        first = client.responses.input_items.list(
+            response.id,
+            limit=1,
+            order="asc",
+        )
+        pages = list(islice(first.iter_pages(), 3))
+        assert len(pages) == 2, (
+            "SDK pagination must advance past an ambiguous duplicate target and terminate"
+        )
+        assert all(len(page.data) == 1 for page in pages), (
+            "the requested one-item page size must remain stable during SDK iteration"
+        )
+        ids = [page.data[0].id for page in pages]
+        assert ids == ["dup", "c"], (
+            "SDK-derived after=dup must reach the later unique item without rewriting the reference target"
+        )
+        assert all(page.last_id == page.data[-1].id for page in pages), (
+            "the documented last_id field must remain the final returned item ID"
+        )
+        assert pages[-1].has_more is False, (
+            "SDK pagination must terminate after reaching the final unique item"
+        )
 
     def test_response_resource_not_found_errors(self, openai_client):
         missing_id = "resp_missing_sdk_integration"
@@ -2552,6 +2691,34 @@ class TestOpenAIResponsesVLLM:
             "the proxy must echo the caller's previous_response_id back to the "
             "client even though it strips the id from the rehydrated upstream "
             f"request; got: {second.previous_response_id!r}"
+        )
+
+    def test_leading_bom_preserves_first_data_only_stream_event(
+        self, witness_backend_client
+    ):
+        """A leading UTF-8 BOM must not hide the first data-only SSE event.
+
+        RFC 3629 Section 6 documents U+FEFF's UTF-8 BOM representation:
+        https://datatracker.ietf.org/doc/html/rfc3629#section-6
+        The requirement to strip one leading BOM while interpreting SSE comes
+        from the WHATWG HTML Standard Section 9.2.6:
+        https://html.spec.whatwg.org/multipage/server-sent-events.html#interpreting-an-event-stream
+        """
+        client, _ = witness_backend_client
+
+        events = list(
+            client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-LEADING-BOM-1546",
+                stream=True,
+                store=False,
+            )
+        )
+        event_types = [event.type for event in events]
+
+        assert event_types == ["response.created", "response.completed"], (
+            "the OpenAI client must receive the first data-only event after the "
+            f"proxy strips one leading UTF-8 BOM; got: {event_types}"
         )
 
     def test_streamed_conversation_append_and_follow_up(self, witness_backend_client):
@@ -3531,7 +3698,7 @@ class TestOpenAIResponsesVLLM:
         assert error.body == {
             "code": "invalid_request_error",
             "message": (
-                "prompt templates are supported only for OpenAI-owned upstreams"
+                "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)"
             ),
             "param": None,
             "type": "invalid_request_error",
@@ -4045,7 +4212,7 @@ class TestResponsesCompactionVLLM:
         assert error.status_code == 400
         assert error.type == "invalid_request_error"
         assert error.body["message"] == (
-            "prompt templates are supported only for OpenAI-owned upstreams"
+            "prompt templates are supported only for OpenAI-owned upstreams; send prompt content via input (OpenAI deprecated reusable prompts)"
         )
 
     def test_invalid_compaction_threshold_is_rejected(self, compact_client):
@@ -5263,6 +5430,159 @@ class TestClientToolCompatVLLM:
         )
         # Request phase echo: the client sees its original ``custom`` tool back.
         assert any(t.type == "custom" for t in response.tools), response.tools
+
+    def test_shell_tool_round_trip_lowers_and_restores(
+        self, client_tool_compat_client
+    ):
+        """A local ``shell`` tool is lowered to a private ``function`` vLLM
+        accepts; the returned call is restored to a schema-complete
+        ``shell_call`` with its parsed action moved into the result."""
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the shell tool with the command: echo ok. "
+                "Do not answer directly. /no_think"
+            ),
+            tools=[{"type": "shell", "environment": {"type": "local"}}],
+            tool_choice={"type": "shell"},
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status == "completed", response
+        shell_calls = [item for item in response.output if item.type == "shell_call"]
+        assert len(shell_calls) >= 1, (
+            "compat filter must restore the function_call to a shell_call; "
+            f"got output types: {[i.type for i in response.output]}"
+        )
+        call = shell_calls[0]
+        assert call.call_id, call
+        assert call.action is not None, call
+        assert call.action.commands, (
+            "restored shell action must include commands: "
+            f"{call.action}"
+        )
+        assert all(command for command in call.action.commands), (
+            "every restored shell command must be non-empty: "
+            f"{call.action}"
+        )
+        assert (
+            call.action.timeout_ms is None or call.action.timeout_ms >= 0
+        ), call.action
+        assert (
+            call.action.max_output_length is None
+            or call.action.max_output_length >= 0
+        ), call.action
+        assert call.environment is not None, (
+            "restored shell call must include its environment: "
+            f"{call}"
+        )
+        assert call.environment.type == "local", (
+            "restored shell call must identify a local environment: "
+            f"{call.environment}"
+        )
+        assert all(item.type != "function_call" for item in response.output), (
+            f"lowered function must not leak: {[i.type for i in response.output]}"
+        )
+        assert any(t.type == "shell" for t in response.tools), response.tools
+
+    def test_tool_search_round_trip_lowers_and_restores(
+        self, client_tool_compat_client
+    ):
+        """A client-executed ``tool_search`` declaration is lowered to a private
+        ``function`` and its restored call preserves client ownership and parsed
+        arguments through the OpenAI SDK."""
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call tool_search for client tools. Do not answer "
+                "directly. /no_think"
+            ),
+            tools=[{"type": "tool_search"}],
+            tool_choice="required",
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status == "completed", response
+        search_calls = [
+            item for item in response.output if item.type == "tool_search_call"
+        ]
+        assert len(search_calls) >= 1, (
+            "compat filter must restore the function_call to a tool_search_call; "
+            f"got output types: {[i.type for i in response.output]}"
+        )
+        call = search_calls[0]
+        assert call.call_id, call
+        assert call.execution == "client", call
+        assert call.arguments is not None, call
+        assert all(item.type != "function_call" for item in response.output), (
+            f"lowered function must not leak: {[i.type for i in response.output]}"
+        )
+        assert any(t.type == "tool_search" for t in response.tools), response.tools
+
+    def test_mcp_namespace_group_name_with_delimiter_is_accepted(
+        self, client_tool_compat_client
+    ):
+        """A ``namespace`` group whose name carries the ``__`` flattening
+        delimiter lowers rather than failing closed.
+
+        Codex names an MCP tool namespace ``mcp__{server}``, so the ``__`` the
+        compat filter uses to delimit its flattened
+        ``agentic_ns__{namespace}__{member}`` wire names appears inside the group
+        name itself. Reserving the delimiter rejected every Codex session that
+        attaches an MCP server with HTTP 400 before any upstream call; the
+        ambiguous pair now takes the hashed wire-name branch instead.
+
+        Asserts only filter-guaranteed, model-independent invariants: whether the
+        small CI model actually calls the member is model-dependent, so the test
+        does not require a live tool call.
+        """
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input="Read the hosts file. /no_think",
+            tools=[
+                {
+                    "type": "namespace",
+                    "name": "mcp__codex_tui",
+                    "description": "Codex MCP tools.",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "read_file",
+                            "description": "Read a file from the workspace.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"],
+                                "additionalProperties": False,
+                            },
+                        }
+                    ],
+                }
+            ],
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        # Reaching a terminal response at all is the regression guard: pre-fix the
+        # compat filter rejected the group name with HTTP 400 (raised by the SDK as
+        # BadRequestError) before any upstream call.
+        assert response.status == "completed", response
+        # No private flattened wire name may leak to the client.
+        leaked = [
+            name
+            for name in (getattr(item, "name", None) for item in response.output)
+            if isinstance(name, str) and name.startswith("agentic_ns__")
+        ]
+        assert not leaked, f"lowered namespace wire name leaked: {leaked}"
+        # Request-phase echo: the client sees its original namespace tool back with
+        # the group name intact, delimiter and all.
+        echoed = [getattr(t, "name", None) for t in response.tools]
+        assert "mcp__codex_tui" in echoed, response.tools
 
     def test_single_round_declared_and_discovered_tools_lower_without_leaking(
         self, client_tool_compat_client
@@ -7418,7 +7738,12 @@ listeners:
 filter_chains:
   - name: file-search-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: ai_operation
+      - filter: openai_responses_request
+        # A facts pass (initialize_state: false) always caches its single parse,
+        # so the managed owner below reuses it and the create body deserializes
+        # exactly once across both passes (#1602).
+        initialize_state: false
       - filter: openai_responses_request
         on_invalid: reject
         headers:
@@ -9435,6 +9760,49 @@ class TestModelRewriteChatCompletionsVLLM:
 
         assert response.status_code == 200, response.text
         assert response.json()["model"] == VLLM_MODEL, response.text
+
+
+# ---------------------------------------------------------------------------
+# Time to first token: native Chat Completions model label
+# ---------------------------------------------------------------------------
+
+
+@requires_real_inference
+def test_native_chat_completions_ttft_labeled_by_request_model(ttft_proxy):
+    """A streamed native chat completion labels TTFT with its request model.
+
+    Drives ``openai_chat_completions_request`` through the OpenAI client: the
+    filter reads the model from the native ``POST /v1/chat/completions`` body and
+    publishes the fact ``time_to_first_token`` records as the
+    ``praxis_ai_ttft_seconds`` model label. Without the request filter the sample
+    would fall back to ``unknown``.
+    """
+    praxis_port, metrics_port = ttft_proxy
+    client = _make_openai_client(praxis_port)
+
+    stream = client.chat.completions.create(
+        model=VLLM_MODEL,
+        messages=[{"role": "user", "content": "Say hello in one word."}],
+        max_tokens=16,
+        stream=True,
+    )
+    chunks = list(stream)
+    assert chunks, "native chat completion should stream at least one chunk"
+
+    # The histogram is recorded as the first SSE chunk is relayed on the response
+    # path; retry briefly so the scrape never races the recorder's render.
+    deadline = time.monotonic() + 10
+    metrics_text = ""
+    while time.monotonic() < deadline:
+        metrics_text = _scrape_metrics(metrics_port)
+        if _has_ttft_sample_for_model(metrics_text, VLLM_MODEL):
+            break
+        time.sleep(0.2)
+
+    assert _has_ttft_sample_for_model(metrics_text, VLLM_MODEL), (
+        "praxis_ai_ttft_seconds must carry a sample labeled with the request "
+        f"model {VLLM_MODEL!r}; got:\n{metrics_text}"
+    )
 
 
 if __name__ == "__main__":

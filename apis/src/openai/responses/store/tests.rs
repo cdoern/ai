@@ -26,7 +26,9 @@ use crate::{
         include::{IncludeField, IncludeFields},
         responses::state::ResponsesState,
     },
-    service::responses::{ListParams, MAX_PAGE_LIMIT, Order, input_items::DEFAULT_PAGE_LIMIT, list_input_items},
+    service::responses::{
+        InputItemPage, ListParams, MAX_PAGE_LIMIT, Order, input_items::DEFAULT_PAGE_LIMIT, list_input_items,
+    },
     store::{
         DEFAULT_STORE_NAME, PersistedStateBackend, ResponseRecord, ResponseStore as _, ResponseStoreRegistry,
         SqliteResponseStore,
@@ -307,8 +309,8 @@ async fn on_request_selects_bounded_stream_buffer_for_non_streaming_responses() 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     install_store(&mut ctx).await;
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "false");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "false");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
 
@@ -331,7 +333,7 @@ async fn on_request_skips_for_get_to_unrelated_path() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/models");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
@@ -361,7 +363,7 @@ async fn on_request_rejects_persistable_request_when_store_not_provisioned() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -377,9 +379,9 @@ async fn on_request_continues_for_previous_response_id_with_store_provisioned() 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     install_store(&mut ctx).await;
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.store", "false");
-    ctx.set_metadata("openai_responses_format.has_previous_response_id", "true");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.store", "false");
+    ctx.set_metadata("openai_responses_request.has_previous_response_id", "true");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
@@ -404,7 +406,7 @@ async fn on_request_body_arms_persistence_for_persisted_response() {
     install_store(&mut ctx).await;
     // openai_responses_request creates ResponsesState earlier in this body phase.
     ctx.extensions.insert(ResponsesState::default());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -427,8 +429,8 @@ async fn on_request_body_does_not_arm_persistence_when_store_false() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(ResponsesState::default());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.store", "false");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.store", "false");
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi","store":false}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -453,9 +455,9 @@ async fn on_request_body_does_not_arm_persistence_for_rehydrate_only() {
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     install_store(&mut ctx).await;
     ctx.extensions.insert(ResponsesState::default());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.store", "false");
-    ctx.set_metadata("openai_responses_format.has_previous_response_id", "true");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.store", "false");
+    ctx.set_metadata("openai_responses_request.has_previous_response_id", "true");
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4.1","input":"Hi","store":false,"previous_response_id":"resp_prev"}"#,
     ));
@@ -498,7 +500,7 @@ async fn on_response_sets_skip_persist_for_non_2xx() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
 
     let mut resp = crate::test_utils::make_response();
@@ -519,7 +521,7 @@ async fn on_response_sets_skip_persist_for_non_json_content_type() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
 
     let mut resp = crate::test_utils::make_response();
@@ -544,7 +546,7 @@ async fn on_response_continues_for_json_200() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
 
     let mut resp = crate::test_utils::make_response();
@@ -561,7 +563,7 @@ async fn on_response_accepts_mixed_case_json_content_type() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
 
     let mut resp = crate::test_utils::make_response();
@@ -583,8 +585,8 @@ async fn on_response_continues_for_event_stream_200() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     run_request_phase(&filter, &mut ctx).await;
 
     let mut resp = crate::test_utils::make_response();
@@ -612,7 +614,7 @@ fn on_response_body_releases_skipped_non_end_of_stream() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from_static(b"partial"));
 
     let action = filter.on_response_body(&mut ctx, &mut body, false).unwrap();
@@ -627,8 +629,8 @@ async fn on_response_body_skips_streaming_persist_on_parse_error() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     run_request_phase(&filter, &mut ctx).await;
 
     ctx.set_metadata("responses.stream_parse_error", "true");
@@ -650,8 +652,8 @@ async fn on_response_body_skips_streaming_persist_on_incomplete_stream() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     run_request_phase(&filter, &mut ctx).await;
 
     ctx.set_metadata("responses.stream_incomplete", "true");
@@ -669,8 +671,8 @@ async fn on_response_body_skips_streaming_persist_when_no_state() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     run_request_phase(&filter, &mut ctx).await;
 
     let mut body: Option<Bytes> = None;
@@ -689,8 +691,8 @@ async fn on_response_body_persists_streaming_response_at_eos() {
     let owner = crate::StateOwner::from_trusted_parts("tenant-stream", "issuer-a", "alice").unwrap();
     ctx.extensions.insert(owner.clone());
     let store = install_store(&mut ctx).await;
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     run_request_phase(&filter, &mut ctx).await;
 
     let response_json = json!({
@@ -758,7 +760,7 @@ async fn on_response_body_releases_when_skip_persist_is_true() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
     ctx.set_metadata("responses.skip_persist", "true");
     let mut body = Some(Bytes::from_static(b"{}"));
@@ -776,8 +778,8 @@ async fn on_response_body_releases_streaming_request_before_eos() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     install_store(&mut ctx).await;
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     let request_action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
         matches!(request_action, FilterAction::Continue),
@@ -1033,8 +1035,8 @@ async fn armed_streaming_ctx<'a>(
 ) -> HttpFilterContext<'a> {
     let mut ctx = crate::test_utils::make_owned_filter_context(req);
     install_recording_store(&mut ctx, store);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     run_request_phase(filter, &mut ctx).await;
 
     ctx.extensions.insert(ResponsesState {
@@ -1258,8 +1260,8 @@ async fn streaming_terminal_frame_propagates_persist_rejection() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
     install_recording_store(&mut ctx, store_dyn);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "true");
     ctx.extensions.insert(ResponsesState {
         response_object: json!({
             "id": "resp_937_reject",
@@ -1545,7 +1547,7 @@ async fn on_response_body_buffers_persistable_non_end_of_stream() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
 
     let mut body = Some(Bytes::from_static(b"{\"id\":\"resp_partial\""));
@@ -1561,7 +1563,7 @@ async fn on_response_body_skips_when_body_is_none() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
     let mut body: Option<Bytes> = None;
 
@@ -1578,7 +1580,7 @@ async fn on_response_body_continues_when_terminal_body_is_none() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     install_store(&mut ctx).await;
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -1601,7 +1603,7 @@ async fn on_response_body_skips_when_body_is_empty() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
     let mut body = Some(Bytes::new());
 
@@ -1617,7 +1619,7 @@ async fn on_response_body_skips_when_body_is_invalid_json() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
     let mut body = Some(Bytes::from_static(b"not json {{{"));
 
@@ -1633,7 +1635,7 @@ async fn on_response_body_skips_when_id_field_missing() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
     let body_json = json!({"created_at": 1000, "model": "gpt-4.1"});
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
@@ -1650,7 +1652,7 @@ async fn on_response_body_skips_when_created_at_field_missing() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
     let body_json = json!({"id": "resp_test", "model": "gpt-4.1"});
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
@@ -1667,7 +1669,7 @@ async fn on_response_body_skips_when_model_field_missing() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     run_request_phase(&filter, &mut ctx).await;
     let body_json = json!({"id": "resp_test", "created_at": 1000});
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
@@ -1685,7 +1687,7 @@ async fn on_response_body_persists_valid_response() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     let store = install_store(&mut ctx).await;
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -1744,7 +1746,7 @@ async fn on_response_body_persists_string_input_as_message_item() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     let store = install_store(&mut ctx).await;
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -1791,7 +1793,7 @@ async fn on_response_body_uses_request_input_when_response_omits_input() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     let store = install_store(&mut ctx).await;
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     ctx.current_filter_id = Some(7);
 
     let request_input = json!([{"role": "user", "content": "Captured request input"}]);
@@ -1858,7 +1860,9 @@ async fn pipeline_persists_after_format_request_body_classification() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
-- filter: openai_responses_format
+- filter: ai_operation
+- filter: openai_responses_request
+  initialize_state: false
 - filter: router
   routes:
     - path_prefix: "/"
@@ -1897,7 +1901,7 @@ async fn pipeline_persists_after_format_request_body_classification() {
         "format classifier should release the buffered request body"
     );
     assert_eq!(
-        ctx.get_metadata("openai_responses_format.format"),
+        ctx.get_metadata("openai_responses_request.format"),
         Some("openai_responses"),
         "format classifier should write metadata before store filter runs"
     );
@@ -1966,7 +1970,9 @@ async fn pipeline_persists_chunked_response_with_unarmed_conversations_filter() 
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
-- filter: openai_responses_format
+- filter: ai_operation
+- filter: openai_responses_request
+  initialize_state: false
 - filter: openai_response_store
   backend: sqlite
   database_url: "{db_url}"
@@ -2074,7 +2080,9 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
-- filter: openai_responses_format
+- filter: ai_operation
+- filter: openai_responses_request
+  initialize_state: false
 - filter: router
   routes:
     - path_prefix: "/"
@@ -2114,7 +2122,7 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
         "format classifier should release the buffered request body"
     );
     assert_eq!(
-        ctx.get_metadata("openai_responses_format.stream"),
+        ctx.get_metadata("openai_responses_request.stream"),
         Some("true"),
         "format classifier should detect stream=true"
     );
@@ -2201,7 +2209,9 @@ async fn pipeline_non_responses_post_does_not_open_sqlite_store() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
-- filter: openai_responses_format
+- filter: ai_operation
+- filter: openai_responses_request
+  initialize_state: false
 - filter: router
   routes:
     - path_prefix: "/"
@@ -2236,12 +2246,14 @@ async fn pipeline_non_responses_post_does_not_open_sqlite_store() {
         .unwrap();
     assert!(
         matches!(request_body_action, FilterAction::Release),
-        "format classifier should release the buffered request body"
+        "the fact publisher should release the buffered request body"
     );
     assert_eq!(
-        ctx.get_metadata("openai_responses_format.format"),
-        Some("openai_chat_completions"),
-        "format classifier should mark Chat Completions traffic"
+        ctx.get_metadata("openai_responses_request.format"),
+        None,
+        "a /v1/chat/completions POST is not a body-bearing Responses operation, \
+         so the fact publisher classifies nothing and publishes no Responses \
+         format fact (head-based protocol identity is ai_operation's job)"
     );
     ctx.buffered_request_body = request_body.clone();
 
@@ -2290,7 +2302,9 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
-- filter: openai_responses_format
+- filter: ai_operation
+- filter: openai_responses_request
+  initialize_state: false
 - filter: router
   routes:
     - path_prefix: "/"
@@ -2430,7 +2444,9 @@ async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
 
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
-- filter: openai_responses_format
+- filter: ai_operation
+- filter: openai_responses_request
+  initialize_state: false
 - filter: router
   routes:
     - path_prefix: "/"
@@ -3990,7 +4006,7 @@ async fn replay_returns_events_in_order_ending_with_terminal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replay_in_legacy_responses_format_pipeline_streams_not_buffers() {
-    // A legacy `openai_responses_format` classifier pipeline marks the request
+    // A classifier-only `openai_responses_request` pipeline marks the request
     // Responses-format with `stream=false` (the flag is read from a POST body the
     // GET never carries). Without forcing streaming mode for replay GETs, the
     // buffered-mode override would run and the runtime would reject the streaming
@@ -4012,8 +4028,8 @@ async fn replay_in_legacy_responses_format_pipeline_streams_not_buffers() {
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.extensions.insert(registry);
     // The legacy classifier promotes these facts before the store filter runs.
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "false");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.stream", "false");
 
     let streaming = expect_streaming(filter.on_request(&mut ctx).await.unwrap());
     assert_eq!(
@@ -4401,6 +4417,75 @@ async fn get_input_items_with_cursor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_input_items_duplicate_ids_paginate_to_later_items() {
+    let filter = make_filter();
+    let registry = init_store_and_seed(
+        "resp_duplicate_cursor",
+        "default",
+        json!([
+            {"id": "dup", "type": "item_reference"},
+            {"id": "dup", "type": "item_reference"},
+            {"id": "c", "type": "item_reference"}
+        ]),
+    )
+    .await;
+
+    let mut cursor: Option<String> = None;
+    let mut ids = Vec::new();
+    for expected_has_more in [true, true, false] {
+        let after = cursor
+            .as_ref()
+            .map_or_else(String::new, |value| format!("&after={value}"));
+        let req = crate::test_utils::make_request(
+            http::Method::GET,
+            &format!("/v1/responses/resp_duplicate_cursor/input_items?limit=1&order=asc{after}"),
+        );
+        let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        ctx.extensions.insert(registry.clone());
+        let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
+        assert_eq!(rejection.status, 200, "every valid duplicate-ID page must return 200");
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        let item_id = body["data"]
+            .as_array()
+            .and_then(|data| data.first())
+            .and_then(|item| item["id"].as_str())
+            .unwrap();
+        let last_id = body["last_id"].as_str().unwrap();
+        assert_eq!(last_id, item_id, "last_id must project the final data item ID");
+        assert_eq!(
+            body["has_more"], expected_has_more,
+            "has_more must track whether another input occurrence remains"
+        );
+        let next_cursor = body["next_cursor"].as_str();
+        if expected_has_more {
+            assert_ne!(
+                next_cursor,
+                Some(item_id),
+                "duplicate reference targets need a separate HTTP continuation cursor"
+            );
+        }
+        ids.push(item_id.to_owned());
+        cursor = next_cursor.map(str::to_owned);
+    }
+
+    assert_eq!(
+        ids.first().map(String::as_str),
+        Some("dup"),
+        "the first reference target must remain unchanged"
+    );
+    assert_eq!(
+        ids.get(1).map(String::as_str),
+        Some("dup"),
+        "the second reference must retain the same target ID"
+    );
+    assert_eq!(
+        ids.get(2).map(String::as_str),
+        Some("c"),
+        "the position cursor must make the later unique item reachable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_with_malformed_cursor_returns_400() {
     let filter = make_filter();
     let registry = init_store_and_seed(
@@ -4671,7 +4756,7 @@ async fn cancel_continues_when_store_unavailable() {
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/resp_abc/cancel");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
@@ -4697,7 +4782,7 @@ async fn input_tokens_continues_when_store_unavailable() {
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
@@ -4723,7 +4808,7 @@ async fn compact_continues_when_store_unavailable() {
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/compact");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
@@ -5564,7 +5649,7 @@ async fn on_request_body_non_end_of_stream_does_not_process() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, false).await.unwrap();
@@ -5598,7 +5683,7 @@ async fn on_response_body_persists_response_with_null_output() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     let store = install_store(&mut ctx).await;
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = json!({
@@ -5631,7 +5716,7 @@ async fn on_response_body_persists_response_with_no_output_field() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     let store = install_store(&mut ctx).await;
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = json!({
@@ -5663,7 +5748,7 @@ async fn on_response_body_persists_response_with_non_array_output() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     let store = install_store(&mut ctx).await;
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = json!({
@@ -5699,7 +5784,7 @@ async fn on_response_body_persists_response_with_object_input() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     let store = install_store(&mut ctx).await;
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = json!({
@@ -5735,7 +5820,7 @@ async fn on_response_body_persists_response_with_null_input() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     let store = install_store(&mut ctx).await;
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = json!({
@@ -5768,7 +5853,7 @@ async fn on_response_body_persists_response_with_no_input_field() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     let store = install_store(&mut ctx).await;
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = json!({
@@ -5801,7 +5886,7 @@ async fn on_response_body_persists_uses_trusted_owner_context() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     let store = install_store(&mut ctx).await;
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_request.format", "openai_responses");
     let owner = crate::StateOwner::from_trusted_parts("custom_tenant", "issuer-a", "alice").unwrap();
     ctx.extensions.insert(owner.clone());
     drop(filter.on_request(&mut ctx).await.unwrap());
@@ -6644,6 +6729,212 @@ conversations_table: openai_conversations
     assert!(
         ResponseStoreFilter::from_config(&yaml).is_ok(),
         "SQLite compares names case-insensitively, so uppercase must still be accepted"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// InputItemPage serialization & allocation tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn input_item_page_serialization_empty_page() {
+    let page = InputItemPage {
+        data: vec![],
+        next_cursor: None,
+        has_more: false,
+    };
+    let json_str = serde_json::to_string(&page).expect("empty page should serialize");
+    let val: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+    assert_eq!(
+        val,
+        json!({
+            "object": "list",
+            "data": [],
+            "has_more": false,
+            "first_id": null,
+            "last_id": null
+        }),
+        "empty page serialization must match expected list schema"
+    );
+}
+
+#[test]
+fn input_item_page_serialization_full_page() {
+    let items: Vec<serde_json::Value> = (0..20)
+        .map(|i| {
+            json!({
+                "id": format!("msg_item_{i}"),
+                "type": "message",
+                "role": "user",
+                "content": format!("content {i}")
+            })
+        })
+        .collect();
+    let page = InputItemPage {
+        data: items.clone(),
+        next_cursor: Some("msg_item_19".to_owned()),
+        has_more: true,
+    };
+    let json_str = serde_json::to_string(&page).expect("full page should serialize");
+    let val: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+    assert_eq!(
+        val,
+        json!({
+            "object": "list",
+            "data": items,
+            "has_more": true,
+            "first_id": "msg_item_0",
+            "last_id": "msg_item_19"
+        }),
+        "full page serialization must match expected list schema"
+    );
+}
+
+#[test]
+fn input_item_page_serialization_maximum_size_100_items() {
+    let items: Vec<serde_json::Value> = (0..100)
+        .map(|i| {
+            json!({
+                "id": format!("msg_max_{i}"),
+                "type": "message",
+                "role": if i % 2 == 0 { "user" } else { "assistant" },
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": format!("Nontrivial text payload for item {i} with additional metadata and details.")
+                    }
+                ],
+                "metadata": {
+                    "index": i,
+                    "tag": "max_page_test"
+                }
+            })
+        })
+        .collect();
+    let page = InputItemPage {
+        data: items.clone(),
+        next_cursor: Some("msg_max_99".to_owned()),
+        has_more: true,
+    };
+    let json_str = serde_json::to_string(&page).expect("100-item page should serialize");
+    let val: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+    assert_eq!(
+        val,
+        json!({
+            "object": "list",
+            "data": items,
+            "has_more": true,
+            "first_id": "msg_max_0",
+            "last_id": "msg_max_99"
+        }),
+        "maximum size 100-item page serialization must match expected list schema"
+    );
+}
+
+#[test]
+fn input_item_page_serialization_non_object_and_cursor_fallback() {
+    let page = InputItemPage {
+        data: vec![json!("plain string input"), json!(12345)],
+        next_cursor: Some("2".to_owned()),
+        has_more: true,
+    };
+    let json_str = serde_json::to_string(&page).expect("non-object page should serialize");
+    let val: serde_json::Value = serde_json::from_str(&json_str).expect("valid json");
+    assert_eq!(
+        val,
+        json!({
+            "object": "list",
+            "data": ["plain string input", 12345],
+            "has_more": true,
+            "first_id": null,
+            "last_id": "2"
+        }),
+        "non-object page serialization must fall back last_id to next_cursor"
+    );
+}
+
+#[test]
+fn input_item_page_serialization_100_item_nontrivial_allocation_evidence() {
+    let items: Vec<serde_json::Value> = (0..100)
+        .map(|i| {
+            json!({
+                "id": format!("msg_nontrivial_{i}"),
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": format!("Nontrivial text payload for item {i}: {}", "x".repeat(200))
+                    }
+                ],
+                "metadata": {
+                    "item_index": i,
+                    "nested_info": {
+                        "key_a": "value_a",
+                        "key_b": 42
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let page = InputItemPage {
+        data: items,
+        next_cursor: Some("msg_nontrivial_99".to_owned()),
+        has_more: true,
+    };
+
+    // Legacy pattern: serde_json::json! deep-copies page.data into a second Value tree
+    let legacy_fn = |p: &InputItemPage| -> Vec<u8> {
+        let first_id = p.data.first().and_then(|v| v.get("id")).and_then(|v| v.as_str());
+        let last_id = p
+            .data
+            .last()
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_str())
+            .or(p.next_cursor.as_deref());
+
+        let body = serde_json::json!({
+            "object": "list",
+            "data": p.data,
+            "has_more": p.has_more,
+            "first_id": first_id,
+            "last_id": last_id,
+        });
+        serde_json::to_vec(&body).unwrap()
+    };
+
+    // New pattern: direct serialization from &page without second Value or Vec<Value> tree
+    let direct_fn = |p: &InputItemPage| -> Vec<u8> { serde_json::to_vec(p).unwrap() };
+
+    let legacy_bytes = legacy_fn(&page);
+    let direct_bytes = direct_fn(&page);
+
+    assert_eq!(
+        legacy_bytes, direct_bytes,
+        "direct serialization output must match legacy json! output byte-for-byte"
+    );
+
+    let legacy_allocs = allocation_counter::measure(|| {
+        std::hint::black_box(legacy_fn(&page));
+    });
+
+    let direct_allocs = allocation_counter::measure(|| {
+        std::hint::black_box(direct_fn(&page));
+    });
+
+    assert!(
+        direct_allocs.count_total < legacy_allocs.count_total,
+        "direct serialization must perform fewer allocations: direct={} legacy={}",
+        direct_allocs.count_total,
+        legacy_allocs.count_total
+    );
+
+    assert!(
+        direct_allocs.bytes_total < legacy_allocs.bytes_total,
+        "direct serialization must allocate fewer bytes: direct={} legacy={}",
+        direct_allocs.bytes_total,
+        legacy_allocs.bytes_total
     );
 }
 
