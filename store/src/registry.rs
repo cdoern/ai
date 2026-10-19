@@ -20,8 +20,8 @@ use crate::{
     owner::StateOwner,
     traits::{PersistedStateBackend, ResponseStore},
     types::{
-        ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,
-        ResponseRecord, StoreError,
+        ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseCasOutcome,
+        ResponseEventRecord, ResponseRecord, StoreError,
     },
 };
 
@@ -71,6 +71,23 @@ impl OwnerScopedStore {
     /// Returns a store error when the backend query fails.
     pub async fn get_response(&self, id: &str) -> Result<Option<ResponseRecord>, StoreError> {
         self.store.get_response(&self.owner, id).await
+    }
+
+    /// Replace a response's stored object while it still matches
+    /// `expected_response_object`, for this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if serialization or the database operation fails.
+    pub async fn compare_and_swap_response_object(
+        &self,
+        id: &str,
+        expected_response_object: &serde_json::Value,
+        response_object: &serde_json::Value,
+    ) -> Result<ResponseCasOutcome, StoreError> {
+        self.store
+            .compare_and_swap_response_object(&self.owner, id, expected_response_object, response_object)
+            .await
     }
 
     /// Delete a response visible to this owner.

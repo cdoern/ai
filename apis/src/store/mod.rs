@@ -42,8 +42,8 @@ pub use praxis_ai_store::{CompressionAlgorithm, SslMode, StoreCompressionConfig}
 // keeps its former name here.
 pub use praxis_ai_store::{
     ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus,
-    OwnerScopedStore as OwnerScopedResponseStore, PendingApprovalRecord, PersistedStateBackend, ResponseEventRecord,
-    ResponseRecord, ResponseStore, StoreError,
+    OwnerScopedStore as OwnerScopedResponseStore, PendingApprovalRecord, PersistedStateBackend, ResponseCasOutcome,
+    ResponseEventRecord, ResponseRecord, ResponseStore, StoreError,
 };
 #[cfg(feature = "store-sqlite")]
 pub use praxis_ai_store_backends::SqliteResponseStore;

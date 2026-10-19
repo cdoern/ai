@@ -16,7 +16,7 @@ use tracing::info;
 
 use super::{
     ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
-    PoolConfig, ResponseEventRecord, ResponseRecord, ResponseStore, SslMode, StoreError,
+    PoolConfig, ResponseCasOutcome, ResponseEventRecord, ResponseRecord, ResponseStore, SslMode, StoreError,
     compression::{StoreCompressionConfig, decode, decode_bytes, run_blocking},
     pool::apply_pool_config,
     postgres_tls::PgTlsConfig,
@@ -151,6 +151,55 @@ impl PostgresResponseStore {
     /// credentials before it becomes a [`StoreError::Database`].
     fn db_err(&self, e: impl std::fmt::Display) -> StoreError {
         StoreError::Database(super::redact_connection_error(&self.redact_url, &e.to_string()))
+    }
+
+    /// Encode an expected/next response-object pair into their stored form.
+    ///
+    /// Both go through the same codec the write path uses, so the comparison
+    /// in a conditional update is against bytes identical to those a prior
+    /// `upsert_response` wrote. One blocking hop covers both payloads.
+    async fn encode_object_pair(
+        &self,
+        expected: &serde_json::Value,
+        next: &serde_json::Value,
+    ) -> Result<[Vec<u8>; 2], StoreError> {
+        let expected_json = serde_json::to_vec(expected).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let next_json = serde_json::to_vec(next).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let mut encoded = self
+            .compression
+            .encode_byte_values(&[&expected_json, &next_json])
+            .await?
+            .into_iter();
+        let [Some(expected), Some(next)] = [encoded.next(), encoded.next()] else {
+            return Err(StoreError::Serialization(
+                "compression returned fewer payloads than submitted".to_owned(),
+            ));
+        };
+        Ok([expected.into_owned(), next.into_owned()])
+    }
+
+    /// Decide why a conditional response-object update changed no row.
+    ///
+    /// Owner-scoped, so a record held by another principal reports
+    /// [`ResponseCasOutcome::NotFound`] exactly like a missing one.
+    async fn classify_failed_swap(&self, owner: &StateOwner, id: &str) -> Result<ResponseCasOutcome, StoreError> {
+        let sql = format!(
+            "SELECT 1 FROM {} WHERE id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4",
+            self.tables.responses
+        );
+        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        Ok(if row.is_some() {
+            ResponseCasOutcome::Mismatch
+        } else {
+            ResponseCasOutcome::NotFound
+        })
     }
 
     /// Append items at the next positions and invalidate the retired message cache.
@@ -720,6 +769,43 @@ impl ResponseStore for PostgresResponseStore {
             .await
             .map_err(|e| self.db_err(&e))?;
         require_owner_preserving_write(result.rows_affected(), "response")
+    }
+
+    async fn compare_and_swap_response_object(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        expected_response_object: &serde_json::Value,
+        response_object: &serde_json::Value,
+    ) -> Result<ResponseCasOutcome, StoreError> {
+        let [expected, next] = self
+            .encode_object_pair(expected_response_object, response_object)
+            .await?;
+
+        let sql = format!(
+            "UPDATE {} SET response_object = $1 \
+             WHERE id = $2 AND tenant_id = $3 AND owner_issuer = $4 AND owner_subject = $5 \
+               AND response_object = $6",
+            self.tables.responses
+        );
+        let result = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(&next)
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .bind(&expected)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| self.db_err(&e))?;
+        if result.rows_affected() > 0 {
+            return Ok(ResponseCasOutcome::Applied);
+        }
+
+        // No row changed: either the object moved on under us, or there is no
+        // record here at all. The follow-up read is owner-scoped, so another
+        // principal's record stays indistinguishable from a missing one.
+        self.classify_failed_swap(owner, id).await
     }
 
     async fn get_response(&self, owner: &StateOwner, id: &str) -> Result<Option<ResponseRecord>, StoreError> {

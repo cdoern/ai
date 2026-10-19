@@ -36,6 +36,6 @@ pub use owner::{StateOwner, StateOwnerError, validate_component};
 pub use registry::{OwnerScopedStore, StoreRegistry};
 pub use traits::{ConversationItemStore, PersistedStateBackend, ResponseStore};
 pub use types::{
-    ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,
-    ResponseRecord, StoreError,
+    ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseCasOutcome,
+    ResponseEventRecord, ResponseRecord, StoreError,
 };

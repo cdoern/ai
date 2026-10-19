@@ -5395,6 +5395,27 @@ async fn sqlite_backend_satisfies_the_store_contract() {
     praxis_ai_store::contract_tests::run_contract_suite(&store).await;
 }
 
+/// The SQLite backend satisfies the same contract with payload compression on.
+///
+/// Worth its own run because the conditional response-object write compares
+/// the *stored* form: with zstd the comparison is against a compressed frame,
+/// not readable JSON, so a predicate that reached inside the payload would
+/// quietly stop matching here while still passing uncompressed.
+#[tokio::test]
+async fn sqlite_backend_satisfies_the_store_contract_with_compression() {
+    let store = SqliteResponseStore::new(
+        "sqlite::memory:",
+        "contract_responses",
+        "contract_conversations",
+        Some("contract_items"),
+        None,
+        Some(&zstd_compression()),
+    )
+    .await
+    .expect("store creation should succeed");
+    praxis_ai_store::contract_tests::run_contract_suite(&store).await;
+}
+
 /// Opening an existing database never converts cache-only conversation history.
 #[tokio::test]
 async fn sqlite_legacy_history_is_preserved_without_startup_conversion() {

@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use crate::{
     owner::StateOwner,
     types::{
-        ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,
-        ResponseRecord, StoreError,
+        ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseCasOutcome,
+        ResponseEventRecord, ResponseRecord, StoreError,
     },
 };
 
@@ -43,6 +43,38 @@ pub trait ResponseStore: Send + Sync {
     ///
     /// Returns [`StoreError`] if the database operation fails.
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError>;
+
+    /// Replace a response's stored object only while it still matches
+    /// `expected_response_object`.
+    ///
+    /// The conditional write is what makes storage, rather than a read then
+    /// write in the caller, the authority for a response's lifecycle. Two
+    /// workers racing to claim the same queued response both compare against
+    /// the queued object, so exactly one observes [`ResponseCasOutcome::Applied`];
+    /// and a worker finishing a response that was cancelled underneath it
+    /// compares against an object that no longer exists, so it cannot overwrite
+    /// the cancellation.
+    ///
+    /// Comparison is on the stored form of the whole object, matching
+    /// [`compare_and_swap_conversation_messages`]. Callers that care only about
+    /// a status field still pass the full object they last read.
+    ///
+    /// Scoped to the exact owner: a record owned by another principal reports
+    /// [`ResponseCasOutcome::NotFound`], indistinguishable from a missing one.
+    ///
+    /// [`compare_and_swap_conversation_messages`]: ConversationItemStore::compare_and_swap_conversation_messages
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if serialization or the database operation fails.
+    /// On error nothing is written.
+    async fn compare_and_swap_response_object(
+        &self,
+        owner: &StateOwner,
+        id: &str,
+        expected_response_object: &serde_json::Value,
+        response_object: &serde_json::Value,
+    ) -> Result<ResponseCasOutcome, StoreError>;
 
     /// Retrieve a response by ID, scoped to an exact owner.
     ///
