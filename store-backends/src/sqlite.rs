@@ -132,53 +132,14 @@ impl SqliteResponseStore {
         self.pool.close().await;
     }
 
-    /// Encode an expected/next response-object pair into their stored form.
-    ///
-    /// Both go through the same codec the write path uses, so the comparison
-    /// in a conditional update is against bytes identical to those a prior
-    /// `upsert_response` wrote. One blocking hop covers both payloads.
-    async fn encode_object_pair(
-        &self,
-        expected: &serde_json::Value,
-        next: &serde_json::Value,
-    ) -> Result<[Vec<u8>; 2], StoreError> {
-        let expected_json = serde_json::to_vec(expected).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let next_json = serde_json::to_vec(next).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let mut encoded = self
-            .compression
-            .encode_byte_values(&[&expected_json, &next_json])
-            .await?
-            .into_iter();
-        let [Some(expected), Some(next)] = [encoded.next(), encoded.next()] else {
-            return Err(StoreError::Serialization(
-                "compression returned fewer payloads than submitted".to_owned(),
-            ));
-        };
-        Ok([expected.into_owned(), next.into_owned()])
-    }
-
-    /// Decide why a conditional response-object update changed no row.
-    ///
-    /// Owner-scoped, so a record held by another principal reports
-    /// [`ResponseCasOutcome::NotFound`] exactly like a missing one.
-    async fn classify_failed_swap(&self, owner: &StateOwner, id: &str) -> Result<ResponseCasOutcome, StoreError> {
-        let sql = format!(
-            "SELECT 1 FROM {} WHERE id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
-            self.tables.responses
-        );
-        let row = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .bind(id)
-            .bind(owner.tenant_id())
-            .bind(owner.issuer())
-            .bind(owner.subject())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StoreError::Database(e.to_string()))?;
-        Ok(if row.is_some() {
-            ResponseCasOutcome::Mismatch
-        } else {
-            ResponseCasOutcome::NotFound
-        })
+    /// Encode one response object into its stored form with the active codec.
+    async fn encode_object(&self, value: &serde_json::Value) -> Result<Vec<u8>, StoreError> {
+        let json = serde_json::to_vec(value).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let mut encoded = self.compression.encode_byte_values(&[&json]).await?.into_iter();
+        encoded
+            .next()
+            .map(std::borrow::Cow::into_owned)
+            .ok_or_else(|| StoreError::Serialization("compression returned no payload".to_owned()))
     }
 
     /// Insert or update a conversation row shared by both store traits.
@@ -602,34 +563,58 @@ impl ResponseStore for SqliteResponseStore {
         expected_response_object: &serde_json::Value,
         response_object: &serde_json::Value,
     ) -> Result<ResponseCasOutcome, StoreError> {
-        let [expected, next] = self
-            .encode_object_pair(expected_response_object, response_object)
-            .await?;
+        // `BEGIN IMMEDIATE` takes the write lock up front so the read, the
+        // comparison and the update are one atomic step and cannot interleave
+        // with a competing claimant.
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        let sql = format!(
-            "UPDATE {} SET response_object = ?1 \
-             WHERE id = ?2 AND tenant_id = ?3 AND owner_issuer = ?4 AND owner_subject = ?5 \
-               AND response_object = ?6",
+        let select = format!(
+            "SELECT response_object FROM {} \
+             WHERE id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
             self.tables.responses
         );
-        let result = sqlx::query(AssertSqlSafe(sql.as_str()))
+        let row = sqlx::query(AssertSqlSafe(select.as_str()))
+            .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        // Owner-scoped, so another principal's record is indistinguishable
+        // from a missing one. Dropping the transaction rolls it back.
+        let Some(row) = row else {
+            return Ok(ResponseCasOutcome::NotFound);
+        };
+        let stored_bytes: Vec<u8> = row
+            .try_get("response_object")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let stored = run_blocking(move || decode(&stored_bytes)).await?;
+        if &stored != expected_response_object {
+            return Ok(ResponseCasOutcome::Mismatch);
+        }
+
+        let next = self.encode_object(response_object).await?;
+        let update = format!(
+            "UPDATE {} SET response_object = ? \
+             WHERE id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",
+            self.tables.responses
+        );
+        sqlx::query(AssertSqlSafe(update.as_str()))
             .bind(&next)
             .bind(id)
             .bind(owner.tenant_id())
             .bind(owner.issuer())
             .bind(owner.subject())
-            .bind(&expected)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
-        if result.rows_affected() > 0 {
-            return Ok(ResponseCasOutcome::Applied);
-        }
-
-        // No row changed: either the object moved on under us, or there is no
-        // record here at all. The follow-up read is owner-scoped, so another
-        // principal's record stays indistinguishable from a missing one.
-        self.classify_failed_swap(owner, id).await
+        tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+        Ok(ResponseCasOutcome::Applied)
     }
 
     async fn get_response(&self, owner: &StateOwner, id: &str) -> Result<Option<ResponseRecord>, StoreError> {

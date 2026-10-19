@@ -55,9 +55,15 @@ pub trait ResponseStore: Send + Sync {
     /// compares against an object that no longer exists, so it cannot overwrite
     /// the cancellation.
     ///
-    /// Comparison is on the stored form of the whole object, matching
-    /// [`compare_and_swap_conversation_messages`]. Callers that care only about
-    /// a status field still pass the full object they last read.
+    /// Comparison is on the whole object, decoded, so it is unaffected by the
+    /// payload codec in force when the record was written. A backend that
+    /// stores an encoded payload must therefore read, compare and update
+    /// inside one transaction rather than predicating on stored bytes: rows
+    /// written before a `compression.algorithm` change still decode (the codec
+    /// is detected per row), so a byte comparison against a freshly encoded
+    /// value would never match again and would strand the record. Callers that
+    /// care only about a status field still pass the full object they last
+    /// read.
     ///
     /// Scoped to the exact owner: a record owned by another principal reports
     /// [`ResponseCasOutcome::NotFound`], indistinguishable from a missing one.

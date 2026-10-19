@@ -270,9 +270,9 @@ impl ResponseStore for InMemoryStore {
         response_object: &serde_json::Value,
     ) -> Result<ResponseCasOutcome, StoreError> {
         let mut inner = self.lock()?;
-        // The SQL backends compare the stored encoding of the object; comparing
-        // the decoded value here is the same test, because encoding a value is
-        // injective for a given codec.
+        // The SQL backends decode the stored payload and compare the same way,
+        // so every backend arbitrates on the decoded value regardless of which
+        // codec wrote the row.
         match inner.responses.get_mut(id).filter(|record| &record.owner == owner) {
             Some(record) if &record.response_object == expected_response_object => {
                 record.response_object = response_object.clone();
