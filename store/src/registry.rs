@@ -90,6 +90,15 @@ impl OwnerScopedStore {
             .await
     }
 
+    /// Fetch a response within a caller-supplied payload ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's read or size error.
+    pub async fn get_response_bounded(&self, id: &str, max_bytes: usize) -> Result<Option<ResponseRecord>, StoreError> {
+        self.store.get_response_bounded(&self.owner, id, max_bytes).await
+    }
+
     /// Delete a response visible to this owner.
     ///
     /// # Errors
@@ -109,6 +118,20 @@ impl OwnerScopedStore {
         // ResponseStore read-only view. Upcast to disambiguate.
         let store: &dyn ResponseStore = self.store.as_ref();
         store.get_conversation(&self.owner, id).await
+    }
+
+    /// Fetch a conversation within a caller-supplied payload ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's read or size error.
+    pub async fn get_conversation_bounded(
+        &self,
+        id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        let store: &dyn ResponseStore = self.store.as_ref();
+        store.get_conversation_bounded(&self.owner, id, max_bytes).await
     }
 
     /// Persist a response only when its immutable owner matches this handle.
@@ -141,6 +164,23 @@ impl OwnerScopedStore {
             .await
     }
 
+    /// Atomically insert this owner's response and approvals without replacing
+    /// an existing response with the same ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when owner validation or the backend write fails.
+    pub async fn persist_response_with_pending_approvals_if_absent(
+        &self,
+        record: &ResponseRecord,
+        pending_approvals: &[PendingApprovalRecord],
+    ) -> Result<bool, StoreError> {
+        self.require_matching_owner(&record.owner)?;
+        self.store
+            .persist_response_with_pending_approvals_if_absent(record, pending_approvals)
+            .await
+    }
+
     /// Retrieve pending approvals issued to this owner.
     ///
     /// # Errors
@@ -153,6 +193,21 @@ impl OwnerScopedStore {
     ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
         self.store
             .get_pending_approvals(&self.owner, response_id, approval_ids)
+            .await
+    }
+
+    /// Size matching pending approvals before fetching their payload columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend query fails.
+    pub async fn pending_approval_payload_bytes(
+        &self,
+        response_id: &str,
+        approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        self.store
+            .pending_approval_payload_bytes(&self.owner, response_id, approval_ids)
             .await
     }
 
@@ -403,6 +458,25 @@ impl OwnerScopedStore {
         }
         self.store
             .create_items_and_sync_messages(&self.owner, conversation_id, items)
+            .await
+    }
+
+    /// Append items only if the transaction's retained payload fits the budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an owner mismatch, budget overflow, or backend error.
+    pub async fn create_items_and_sync_messages_bounded(
+        &self,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+        max_rebuild_bytes: usize,
+    ) -> Result<(), StoreError> {
+        for item in items {
+            self.require_matching_owner(&item.owner)?;
+        }
+        self.store
+            .create_items_and_sync_messages_bounded(&self.owner, conversation_id, items, max_rebuild_bytes)
             .await
     }
 

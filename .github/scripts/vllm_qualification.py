@@ -200,7 +200,7 @@ def capture(args):
         "gateway": {"checkout_sha": command("git", "rev-parse", "HEAD"),
                     "binary": "target/debug/praxis-ai",
                     "binary_sha256": file_hash("target/debug/praxis-ai"),
-                    "build_profile": "cargo build -p praxis-ai-proxy --features full (debug)",
+                    "build_profile": "cargo build -p praxis-ai-proxy --features full,openai-all,store-postgres (debug)",
                     "praxis_version": locked_version("praxis-proxy"),
                     "praxis_filter_version": locked_version("praxis-proxy-filter")},
         "backend": {"mode": "real-vllm-gpu", "version": command(runtime, "exec", "vllm", "python", "-c", "import vllm; print(vllm.__version__)"),
@@ -354,6 +354,7 @@ def render(report, detailed=False):
     lines = [START, "### vLLM Responses gateway qualification", ""]
     if status == "unavailable":
         lines.append("vLLM Responses gateway qualification: unavailable for this release commit. No usable exact-commit GPU qualification report was found.")
+        lines += ["", f"Reason: {report.get('reason', 'GPU evidence unavailable')}."]
     elif status == "not_requested":
         lines.append("vLLM Responses gateway qualification: GPU testing was not requested.")
     else:
@@ -422,9 +423,9 @@ def render(report, detailed=False):
     return "\n".join(lines)
 
 
-def compose_notes(existing, section):
-    if START in existing and END in existing:
-        return existing[:existing.index(START)] + section.rstrip() + existing[existing.index(END) + len(END):]
+def compose_notes(existing, section, start=START, end=END):
+    if start in existing and end in existing:
+        return existing[:existing.index(start)] + section.rstrip() + existing[existing.index(end) + len(end):]
     return existing.rstrip() + "\n\n" + section
 
 
