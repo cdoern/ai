@@ -936,13 +936,15 @@ impl crate::store::ResponseStore for RecordingResponseStore {
 
     async fn compare_and_swap_response_object(
         &self,
-        _owner: &crate::StateOwner,
+        owner: &crate::StateOwner,
         id: &str,
         expected_response_object: &serde_json::Value,
         response_object: &serde_json::Value,
     ) -> Result<crate::store::ResponseCasOutcome, crate::store::StoreError> {
         let mut records = self.records.lock().expect("records mutex should not be poisoned");
-        match records.get_mut(id) {
+        // Owner-scoped like the real backends: another principal's record is
+        // reported as missing rather than swapped.
+        match records.get_mut(id).filter(|record| &record.owner == owner) {
             Some(record) if &record.response_object == expected_response_object => {
                 record.response_object = response_object.clone();
                 Ok(crate::store::ResponseCasOutcome::Applied)

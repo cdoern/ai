@@ -143,10 +143,16 @@ impl SqliteResponseStore {
     async fn encode_object(&self, value: &serde_json::Value) -> Result<Vec<u8>, StoreError> {
         let json = serde_json::to_vec(value).map_err(|e| StoreError::Serialization(e.to_string()))?;
         let mut encoded = self.compression.encode_byte_values(&[&json]).await?.into_iter();
-        encoded
-            .next()
-            .map(std::borrow::Cow::into_owned)
-            .ok_or_else(|| StoreError::Serialization("compression returned no payload".to_owned()))
+        let Some(payload) = encoded.next() else {
+            return Err(StoreError::Serialization("compression returned no payload".to_owned()));
+        };
+        // With `algorithm: none` the codec hands back a borrow of `json`, so the
+        // buffer we already own is the stored form: move it rather than copying
+        // the whole object on every transition. zstd allocates its own frame.
+        Ok(match payload {
+            std::borrow::Cow::Borrowed(_) => json,
+            std::borrow::Cow::Owned(frame) => frame,
+        })
     }
 
     /// Insert or update a conversation row shared by both store traits.
