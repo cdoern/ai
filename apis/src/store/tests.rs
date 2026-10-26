@@ -5480,6 +5480,137 @@ async fn sqlite_backend_satisfies_the_store_contract() {
     praxis_ai_store::contract_tests::run_contract_suite(&store).await;
 }
 
+/// Seed a response in a file-backed store so concurrent tasks get real
+/// (>1) connections and race at the database rather than in the pool.
+async fn seed_racing_response(
+    dir: &std::path::Path,
+    name: &str,
+    owner: &crate::StateOwner,
+    object: &serde_json::Value,
+) -> Arc<SqliteResponseStore> {
+    let url = format!("sqlite://{}?mode=rwc", dir.join(name).display());
+    let store = Arc::new(
+        SqliteResponseStore::new(&url, "test_responses", "test_conversations", None, None, None)
+            .await
+            .expect("store creation should succeed"),
+    );
+    store
+        .upsert_response(&ResponseRecord {
+            id: "resp_race".to_owned(),
+            owner: owner.clone(),
+            created_at: 1,
+            model: "m".to_owned(),
+            response_object: object.clone(),
+            input: json!({}),
+            messages: json!([]),
+        })
+        .await
+        .expect("seed response");
+    store
+}
+
+/// Two workers racing to claim the same queued response: exactly one wins.
+///
+/// The shared contract suite drives CAS sequentially, and its SQLite run uses
+/// `sqlite::memory:`, which forces a single-connection pool. Neither exercises
+/// the race this primitive exists to arbitrate, so it is tested here against a
+/// file-backed store.
+#[tokio::test]
+async fn concurrent_claims_of_one_queued_response_apply_exactly_once() {
+    let dir = tempfile::tempdir().expect("temp dir should be created");
+    let owner = crate::test_utils::test_owner("tenant_race");
+    let queued = json!({"id": "resp_race", "status": "queued"});
+    let running = json!({"id": "resp_race", "status": "in_progress"});
+    let store = seed_racing_response(dir.path(), "claim_race.db", &owner, &queued).await;
+
+    let (a, b) = (Arc::clone(&store), Arc::clone(&store));
+    let (owner_a, owner_b) = (owner.clone(), owner.clone());
+    let (queued_a, queued_b) = (queued.clone(), queued.clone());
+    let (running_a, running_b) = (running.clone(), running.clone());
+    let task_a = tokio::spawn(async move {
+        a.compare_and_swap_response_object(&owner_a, "resp_race", &queued_a, &running_a)
+            .await
+    });
+    let task_b = tokio::spawn(async move {
+        b.compare_and_swap_response_object(&owner_b, "resp_race", &queued_b, &running_b)
+            .await
+    });
+
+    let outcomes = [
+        task_a.await.expect("task a joins").expect("claim a succeeds"),
+        task_b.await.expect("task b joins").expect("claim b succeeds"),
+    ];
+    let applied = outcomes
+        .iter()
+        .filter(|outcome| **outcome == ResponseCasOutcome::Applied)
+        .count();
+    assert_eq!(applied, 1, "exactly one claimant must win, got {outcomes:?}");
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == ResponseCasOutcome::Mismatch)
+            .count(),
+        1,
+        "the loser must observe a mismatch, got {outcomes:?}"
+    );
+}
+
+/// A cancellation racing a worker's terminal write: exactly one applies, and
+/// the record ends on whichever won rather than on a blend of the two.
+///
+/// This is the race the primitive exists to prevent — a completing worker must
+/// not overwrite a cancellation, and vice versa.
+#[tokio::test]
+async fn cancellation_racing_completion_applies_exactly_once() {
+    let dir = tempfile::tempdir().expect("temp dir should be created");
+    let owner = crate::test_utils::test_owner("tenant_race");
+    let running = json!({"id": "resp_race", "status": "in_progress"});
+    let cancelled = json!({"id": "resp_race", "status": "cancelled"});
+    let completed = json!({"id": "resp_race", "status": "completed"});
+    let store = seed_racing_response(dir.path(), "terminal_race.db", &owner, &running).await;
+
+    let (a, b) = (Arc::clone(&store), Arc::clone(&store));
+    let (owner_a, owner_b) = (owner.clone(), owner.clone());
+    let (running_a, running_b) = (running.clone(), running.clone());
+    let (cancelled_task, completed_task) = (cancelled.clone(), completed.clone());
+    let canceller = tokio::spawn(async move {
+        a.compare_and_swap_response_object(&owner_a, "resp_race", &running_a, &cancelled_task)
+            .await
+    });
+    let completer = tokio::spawn(async move {
+        b.compare_and_swap_response_object(&owner_b, "resp_race", &running_b, &completed_task)
+            .await
+    });
+
+    let outcomes = [
+        canceller.await.expect("cancel joins").expect("cancel succeeds"),
+        completer.await.expect("complete joins").expect("complete succeeds"),
+    ];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == ResponseCasOutcome::Applied)
+            .count(),
+        1,
+        "exactly one terminal transition must apply, got {outcomes:?}"
+    );
+
+    let stored = store
+        .get_response(&owner, "resp_race")
+        .await
+        .expect("read back")
+        .expect("response present");
+    assert!(
+        stored.response_object == cancelled || stored.response_object == completed,
+        "the record must end on one writer's value, not a blend: {:?}",
+        stored.response_object
+    );
+    assert_ne!(
+        stored.response_object, running,
+        "the losing writer must not leave the record in its pre-transition state"
+    );
+}
+
 /// A response written before compression was enabled stays swappable after it
 /// is turned on.
 ///

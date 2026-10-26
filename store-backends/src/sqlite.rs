@@ -576,6 +576,12 @@ impl ResponseStore for SqliteResponseStore {
         expected_response_object: &serde_json::Value,
         response_object: &serde_json::Value,
     ) -> Result<ResponseCasOutcome, StoreError> {
+        // Encode before opening the transaction: compressing a large object is
+        // the slowest step here, and `BEGIN IMMEDIATE` would otherwise hold the
+        // write lock across it. The cost is a wasted encode when the comparison
+        // then fails, which is the rarer path.
+        let next = self.encode_object(response_object).await?;
+
         // `BEGIN IMMEDIATE` takes the write lock up front so the read, the
         // comparison and the update are one atomic step and cannot interleave
         // with a competing claimant.
@@ -611,7 +617,6 @@ impl ResponseStore for SqliteResponseStore {
             return Ok(ResponseCasOutcome::Mismatch);
         }
 
-        let next = self.encode_object(response_object).await?;
         let update = format!(
             "UPDATE {} SET response_object = ? \
              WHERE id = ? AND tenant_id = ? AND owner_issuer = ? AND owner_subject = ?",

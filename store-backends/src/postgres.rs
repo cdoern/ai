@@ -752,6 +752,12 @@ impl ResponseStore for PostgresResponseStore {
         expected_response_object: &serde_json::Value,
         response_object: &serde_json::Value,
     ) -> Result<ResponseCasOutcome, StoreError> {
+        // Encode before opening the transaction: compressing a large object is
+        // the slowest step here, and `FOR UPDATE` would otherwise hold the row
+        // lock across it. The cost is a wasted encode when the comparison then
+        // fails, which is the rarer path.
+        let next = self.encode_object(response_object).await?;
+
         // `FOR UPDATE` holds the row for the life of the transaction so the
         // read, the comparison and the update are one atomic step and cannot
         // interleave with a competing claimant. The begin future is boxed to
@@ -783,7 +789,6 @@ impl ResponseStore for PostgresResponseStore {
             return Ok(ResponseCasOutcome::Mismatch);
         }
 
-        let next = self.encode_object(response_object).await?;
         let update = format!(
             "UPDATE {} SET response_object = $1 \
              WHERE id = $2 AND tenant_id = $3 AND owner_issuer = $4 AND owner_subject = $5",
