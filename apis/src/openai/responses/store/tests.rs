@@ -1966,6 +1966,15 @@ async fn pipeline_persists_after_format_request_body_classification() {
         "input": [{"role": "user", "content": "Hello"}]
     });
     let mut request_body = Some(Bytes::from(serde_json::to_vec(&request_json).unwrap()));
+    // Run the request-head phase first so `ai_operation` publishes its match
+    // before the body pre-read, exactly as core sequences the real pipeline.
+    assert!(
+        matches!(
+            pipeline.execute_http_request_head(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "request-head phase should classify before the body pre-read"
+    );
     let request_body_action = pipeline
         .execute_http_request_body(&mut ctx, &mut request_body, true)
         .await
@@ -2076,6 +2085,15 @@ async fn pipeline_persists_chunked_response_with_unarmed_conversations_filter() 
         "input": [{"role": "user", "content": "Hello"}]
     });
     let mut request_body = Some(Bytes::from(serde_json::to_vec(&request_json).unwrap()));
+    // Run the request-head phase first so `ai_operation` publishes its match
+    // before the body pre-read, exactly as core sequences the real pipeline.
+    assert!(
+        matches!(
+            pipeline.execute_http_request_head(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "request-head phase should classify before the body pre-read"
+    );
     assert!(matches!(
         pipeline
             .execute_http_request_body(&mut ctx, &mut request_body, true)
@@ -2187,6 +2205,15 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
         "stream": true
     });
     let mut request_body = Some(Bytes::from(serde_json::to_vec(&request_json).unwrap()));
+    // Run the request-head phase first so `ai_operation` publishes its match
+    // before the body pre-read, exactly as core sequences the real pipeline.
+    assert!(
+        matches!(
+            pipeline.execute_http_request_head(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "request-head phase should classify before the body pre-read"
+    );
     let request_body_action = pipeline
         .execute_http_request_body(&mut ctx, &mut request_body, true)
         .await
@@ -2314,6 +2341,15 @@ async fn pipeline_non_responses_post_does_not_open_sqlite_store() {
         "messages": [{"role": "user", "content": "Hello"}]
     });
     let mut request_body = Some(Bytes::from(serde_json::to_vec(&request_json).unwrap()));
+    // Run the request-head phase first so `ai_operation` publishes its match
+    // before the body pre-read, exactly as core sequences the real pipeline.
+    assert!(
+        matches!(
+            pipeline.execute_http_request_head(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "request-head phase should classify before the body pre-read"
+    );
     let request_body_action = pipeline
         .execute_http_request_body(&mut ctx, &mut request_body, true)
         .await
@@ -2411,6 +2447,15 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
         "previous_response_id": "resp_prev"
     });
     let mut request_body = Some(Bytes::from(serde_json::to_vec(&request_json).unwrap()));
+    // Run the request-head phase first so `ai_operation` publishes its match
+    // before the body pre-read, exactly as core sequences the real pipeline.
+    assert!(
+        matches!(
+            pipeline.execute_http_request_head(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "request-head phase should classify before the body pre-read"
+    );
     let request_body_action = pipeline
         .execute_http_request_body(&mut ctx, &mut request_body, true)
         .await
@@ -2553,6 +2598,15 @@ async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
         "previous_response_id": "resp_prev"
     });
     let mut request_body = Some(Bytes::from(serde_json::to_vec(&request_json).unwrap()));
+    // Run the request-head phase first so `ai_operation` publishes its match
+    // before the body pre-read, exactly as core sequences the real pipeline.
+    assert!(
+        matches!(
+            pipeline.execute_http_request_head(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "request-head phase should classify before the body pre-read"
+    );
     let request_body_action = pipeline
         .execute_http_request_body(&mut ctx, &mut request_body, true)
         .await

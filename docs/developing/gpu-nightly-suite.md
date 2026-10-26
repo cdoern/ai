@@ -50,7 +50,8 @@ backend can serve the same client.
 | **Codex CLI** | translated | Responses → Chat Completions | `/v1/chat/completions` |
 | **Claude Code** | native | Anthropic Messages passed through | `/v1/messages` |
 | **Claude Code** | translated | `anthropic_messages_to_chat_completions[_stream]` | `/v1/chat/completions` |
-| **OpenCode** | native | Chat Completions passed through | `/v1/chat/completions` |
+| **OpenCode** | native | Chat Completions passed through, CLI **1.x and 2.x** | `/v1/chat/completions` |
+| **pi** | native | Chat Completions passed through (`openai-completions` provider) | `/v1/chat/completions` |
 | **OpenAI Agents SDK** | native | SDK-owned tool loop over Responses | `/v1/responses` |
 | **OpenAI SDK (Responses)** | native | Responses SDK suite, SDK **2.x and 3.x** | `/v1/responses` |
 | **OpenAI SDK (Chat Completions)** | translated (selected provider) | `openai_chat_completions_to_anthropic[_stream]` | `/v1/messages` |
@@ -106,38 +107,48 @@ covers the Anthropic SDK image/vision path against `Qwen3-VL-4B-Instruct`.
 
 ### Known model limitation: self-compaction task completion on Qwen3-8B
 
-The self-compaction tests prove two things independently of model capability,
-and these are **always hard assertions**:
+The self-compaction tests require these hard assertions:
 
 1. The pinned CLI performed its **own** self-compaction. Codex's summarization
    request is observed **traversing Praxis** on the wire. Claude Code's
    `compact_boundary {trigger: auto}` is a client-side stream-json event that is
    local to the CLI (it does not itself cross Praxis); the test observes that event
-   and separately verifies post-boundary requests continue **through Praxis**.
-2. The session **continued after the boundary** — at least one more successful
-   tool call flowed through Praxis post-compaction.
+   and separately verifies that the pre-compaction Read carrying the per-run
+   marker reached Praxis and returned successfully.
 
-What Qwen3-8B cannot do reliably is **finish the downstream chore** after it
-self-compacts. It either falls into a loop re-reading the same ballast file until
-the deadline, or drops the high-entropy marker across its own lossy summary and
-writes the wrong value. This is a model-capability limit, not a proxy or flake,
-and it was observed on **both** lanes against live Qwen3-8B.
+On the Claude Code Qwen3-8B lane, a post-compaction tool call is checked when the
+model emits one, but its absence is an expected limitation and is logged as
+`XFAIL`. That lane still proves the client self-compacted and that the marker
+Read passed through Praxis before compaction; it does not claim a post-compaction
+request traversed Praxis when none was emitted. Other Claude Code models and the
+Codex lane retain a hard post-compaction continuation requirement.
 
-Both lanes grade identically by design — **XFAIL on Qwen3-8B**:
+Qwen3-8B also cannot reliably **finish the downstream chore** after it
+self-compacts. It may stop after its summary, loop re-reading the same ballast
+file until the deadline, or drop the high-entropy marker across its lossy summary
+and write the wrong value. A deterministic scripted-provider integration test
+covers compaction-history rehydration and forwarding separately from this
+model-driven acceptance lane.
 
-- **Codex.** After the hard wire-compaction proof, the downstream
+The downstream task-completion oracle is an **XFAIL on Qwen3-8B**:
+
+- **Codex.** After the hard wire-compaction and post-compaction continuation
+  proofs, the downstream
   task-completion assertions (correct `result.txt`, wire ordering of the write
   after compaction, the ordered JSONL trace, `./verify.sh`) are **skipped** when
   the live model matches `COMPACTION_XFAIL_MODEL` (`qwen3-8b`), with an
   `XFAIL (...)` line logged.
-- **Claude Code.** Same shape: after the hard proofs (self-compaction boundary,
-  the pre-compaction Read carrying the marker through Praxis, and a
-  post-compaction tool call through Praxis), the downstream completion assertions
+- **Claude Code.** After the hard proofs (self-compaction boundary and the
+  pre-compaction Read carrying the marker through Praxis), the test checks for a
+  post-compaction tool call. On Qwen3-8B, an absent call is logged as an expected
+  XFAIL; if a call is emitted, the test verifies it followed compaction. The
+  downstream completion assertions
   (successful post-compaction Edit of the uppercase marker into
   `result/value.txt`, then a passing `./verify.sh`) are **skipped** on
-  `COMPACTION_XFAIL_MODEL`, with an `XFAIL (...)` line logged. The prompt steers a
-  post-compaction re-read of `source/value.txt` to recover the marker, but the
-  oracle never mandated that specific tool call.
+  `COMPACTION_XFAIL_MODEL`, with an `XFAIL (...)` line logged. On capable models,
+  post-compaction continuation and task completion remain hard requirements. The
+  prompt steers a post-compaction re-read of `source/value.txt` to recover the
+  marker, but the oracle never mandates that specific tool call.
 
 Each lane uses a shorter deadline (`COMPACTION_XFAIL_CHILD_TIMEOUT`, 180s) on the
 XFAIL model so a looping run ends quickly once compaction is already captured.
@@ -247,12 +258,23 @@ for a pulled image.
 - `vllm-gpu-codex-acceptance` — pinned Codex over native Responses + translated
   Chat paths.
 - `vllm-gpu-opencode-acceptance` — pinned OpenCode over the native Chat
-  Completions path: one text turn and one tool-call round trip, in its own
-  locked-down network namespace.
-- `pins` — parses `tests/integration/fixtures/claude-code-cli/pin.toml` and
-  `tests/integration/fixtures/opencode-cli/pin.toml`, cross-validates their
-  invariants, and exports every value the acceptance jobs consume so those
-  jobs carry no hardcoded version strings.
+  Completions path: one text turn and one tool-call round trip for each of the
+  pinned 1.x and 2.x clients, against one shared vLLM container in its own
+  locked-down network namespace. Each major is reported as separate cases
+  (`opencode_text`, `opencode_tool_call`, `opencode_v2_text`,
+  `opencode_v2_tool_call`).
+- `vllm-gpu-pi-acceptance` — pinned pi over the same native Chat Completions
+  path, with the documented `models.json`: one text turn and one tool-call
+  round trip (`pi_text`, `pi_tool_call`). It runs its own vLLM container from
+  the OpenCode backend pins and launches the client inside its own locked-down
+  network namespace.
+- `pins` — parses `tests/integration/fixtures/claude-code-cli/pin.toml`,
+  `tests/integration/fixtures/opencode-cli/pin.toml`,
+  `tests/integration/fixtures/opencode-cli-v2/pin.toml`, and
+  `tests/integration/fixtures/pi-cli/pin.toml`, cross-validates their
+  invariants (each OpenCode manifest against its own declared major, and pi
+  against the OpenCode backend pins it shares), and exports every value the
+  acceptance jobs consume so those jobs carry no hardcoded version strings.
 - `gpu-qualification-summary` — writes `qualification.json` and the Actions
   summary even if provisioning fails.
 
@@ -279,10 +301,20 @@ carry the detail.
 - `tests/integration/tests/suite/codex_http.rs` — Codex acceptance + pin-update
   instructions.
 - `tests/integration/tests/suite/opencode_vllm.rs` — OpenCode acceptance
-  (`opencode_vllm_plugin_auth_completes_text_turn`,
+  (`opencode_vllm_options_headers_auth_completes_text_turn`,
   `opencode_vllm_tool_call_round_trip_writes_hash_verified_marker`). The
   deterministic CPU lane is `suite/opencode.rs`, run by the `opencode-cpu`
   job in `integration.yaml`.
+- `tests/integration/tests/suite/opencode_v2_vllm.rs` — OpenCode 2.x
+  acceptance (`opencode_v2_vllm_plugin_auth_completes_text_turn`,
+  `opencode_v2_vllm_tool_call_round_trip_writes_hash_verified_marker`). The
+  deterministic CPU lane is `suite/opencode_v2.rs`, run by the
+  `opencode-v2-cpu` job in `integration.yaml`.
+- `tests/integration/tests/suite/pi_vllm.rs` — pi acceptance
+  (`pi_vllm_documented_config_completes_text_turn`,
+  `pi_vllm_tool_call_round_trip_writes_hash_verified_marker`). The
+  deterministic CPU lane is `suite/pi.rs`, run by the `pi-cpu` job in
+  `integration.yaml`.
 - `tests/integration/tests/suite/live_vllm.rs` — namespace, egress-probe and
   example-patching scaffolding shared by the live CLI suites.
 
@@ -303,9 +335,10 @@ VLLM_MODEL=Qwen/Qwen3-8B VLLM_TEST_BACKEND=live \
   (`qualification.json` schema, report fields, pass/fail semantics, release
   selection).
 - [cli-vllm-through-praxis.md](cli-vllm-through-praxis.md) — running Codex /
-  Claude Code / OpenCode through Praxis and vLLM; reasoning-flag regression,
-  the headless `opencode run` form, and the OpenCode plugin's fail-open
-  behavior.
+  Claude Code / OpenCode / pi through Praxis and vLLM; reasoning-flag
+  regression, the headless `opencode run` and `pi --print` forms, each
+  OpenCode major's documented credential recipes, how the 2.x plugin behaves
+  when it fails, and how pi's credential recipe behaves when it fails.
 - [`vllm/README.md`](../../vllm/README.md) — GPU container: build, run, health
   check, hardware/model rationale.
 - [llmd-integration-testing.md](llmd-integration-testing.md) — adjacent CPU-side

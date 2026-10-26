@@ -966,6 +966,280 @@ fn should_compact_skips_when_previous_usage_below_threshold() {
     assert!(result.is_none(), "should skip when previous_usage is below threshold");
 }
 
+#[test]
+fn compaction_source_rejects_non_text_content_parts() {
+    for kind in ["input_image", "input_file", "input_audio"] {
+        let messages = [json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": kind, "image_url": "https://example.test/asset"}]
+        })];
+        let Err(FilterAction::Reject(rejection)) = validate_compaction_source(messages.iter()) else {
+            panic!("{kind} must be rejected before compaction");
+        };
+        assert_eq!(rejection.status, 400, "{kind} rejection must return HTTP 400");
+        let body = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+        assert!(body.contains("non-text"), "unexpected rejection: {body}");
+        assert!(body.contains(kind), "unexpected rejection: {body}");
+    }
+}
+
+#[test]
+fn compaction_source_rejects_mixed_text_and_image_content() {
+    let messages = [json!({
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "look"},
+            {"type": "input_image", "image_url": "https://example.test/image.png"}
+        ]
+    })];
+    assert!(
+        validate_compaction_source(messages.iter()).is_err(),
+        "mixed text and image content must be rejected"
+    );
+}
+
+#[test]
+fn compaction_source_accepts_text_only_messages_and_function_outputs() {
+    let messages = [
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}]
+        }),
+        json!({
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": [
+                {"type": "output_text", "text": "pass", "annotations": [], "logprobs": []},
+                {"type": "text", "text": "word"}
+            ]
+        }),
+    ];
+    validate_compaction_source(messages.iter()).expect("text-only source must remain compactable");
+}
+
+#[test]
+fn compaction_source_keeps_safe_reasoning_summary_and_omits_raw_reasoning() {
+    let messages = [
+        json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "status": "completed",
+            "summary": [{"type": "summary_text", "text": "safe reasoning summary"}],
+            "content": [{"type": "reasoning_text", "text": "PRIVATE-RAW-REASONING"}]
+        }),
+        json!({"type": "message", "role": "assistant", "content": "visible answer"}),
+    ];
+
+    validate_compaction_source(messages.iter()).expect("standard reasoning items should be compactable");
+    let rendered = build_conversation_text(messages.iter());
+    assert!(
+        rendered.contains("safe reasoning summary"),
+        "safe summary should reach the compactor: {rendered}"
+    );
+    assert!(
+        rendered.contains("visible answer"),
+        "visible assistant text should reach the compactor: {rendered}"
+    );
+    assert!(
+        !rendered.contains("PRIVATE-RAW-REASONING"),
+        "raw chain-of-thought must not reach the compactor"
+    );
+}
+
+#[test]
+fn compaction_source_accepts_reasoning_item_with_empty_summary() {
+    let messages = [
+        json!({"type": "reasoning", "id": "rs_qwen", "status": "completed", "summary": []}),
+        json!({"type": "message", "role": "assistant", "content": "visible answer"}),
+    ];
+
+    validate_compaction_source(messages.iter()).expect("empty reasoning summaries should not block compaction");
+    let rendered = build_conversation_text(messages.iter());
+    assert!(
+        rendered.contains("visible answer"),
+        "visible answer should reach the compactor: {rendered}"
+    );
+    assert!(
+        !rendered.contains("reasoning"),
+        "empty reasoning item should contribute no prompt text: {rendered}"
+    );
+}
+
+#[test]
+fn compaction_source_accepts_reasoning_item_with_null_status() {
+    let messages = [json!({
+        "type": "reasoning",
+        "id": "rs_null_status",
+        "status": null,
+        "summary": []
+    })];
+
+    validate_compaction_source(messages.iter()).expect("null reasoning status is equivalent to an absent status");
+}
+
+#[test]
+fn compaction_source_rejects_encrypted_reasoning_state() {
+    let messages = [json!({
+        "type": "reasoning",
+        "id": "rs_opaque",
+        "summary": [],
+        "encrypted_content": "provider-opaque-state"
+    })];
+
+    let Err(FilterAction::Reject(rejection)) = validate_compaction_source(messages.iter()) else {
+        panic!("opaque reasoning state must remain fail-closed during compaction");
+    };
+    assert_eq!(rejection.status, 400, "opaque reasoning must return HTTP 400");
+    let body = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(body.contains("encrypted reasoning"), "unexpected rejection: {body}");
+}
+
+#[test]
+fn compaction_source_rejects_unrepresentable_reasoning_items() {
+    let cases = [
+        json!({"type": "reasoning", "id": "rs_1", "summary": [], "extra": 1}),
+        json!({"type": "reasoning", "summary": []}),
+        json!({"type": "reasoning", "id": 7, "summary": []}),
+        json!({"type": "reasoning", "id": "rs_1", "status": "bogus", "summary": []}),
+        json!({"type": "reasoning", "id": "rs_1"}),
+        json!({"type": "reasoning", "id": "rs_1", "summary": "not an array"}),
+        json!({"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": 1}]}),
+        json!({"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "x", "extra": 1}]}),
+        json!({"type": "reasoning", "id": "rs_1", "summary": [], "content": "not an array"}),
+        json!({"type": "reasoning", "id": "rs_1", "summary": [], "content": [{"type": "other", "text": "x"}]}),
+        json!({"type": "reasoning", "id": "rs_1", "summary": [], "content": [{"type": "reasoning_text", "text": 1}]}),
+        json!({"type": "reasoning", "id": "rs_1", "summary": [], "content": [{"type": "reasoning_text", "text": "x", "extra": 1}]}),
+    ];
+
+    for item in cases {
+        assert_compaction_source_rejects_reasoning_item(item);
+    }
+}
+
+#[test]
+fn compaction_source_accepts_null_encrypted_reasoning_content() {
+    let messages = [json!({
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [],
+        "encrypted_content": null
+    })];
+
+    validate_compaction_source(messages.iter()).expect("null encrypted_content carries no opaque state");
+}
+
+#[test]
+fn compaction_source_accepts_renderable_compaction_summary() {
+    let messages = [build_compaction_item(
+        "compact_prior",
+        "Prior context.",
+        DEFAULT_SUMMARY_PREFIX,
+    )];
+
+    validate_compaction_source(messages.iter()).expect("a non-empty UTF-8 compaction summary is representable");
+}
+
+#[test]
+fn compaction_source_rejects_unrenderable_compaction_summaries() {
+    for encrypted_content in ["not-valid-base64", "", "/w=="] {
+        let messages = [json!({
+            "type": "compaction",
+            "encrypted_content": encrypted_content
+        })];
+        let Err(FilterAction::Reject(rejection)) = validate_compaction_source(messages.iter()) else {
+            panic!("unrenderable compaction content must be rejected: {encrypted_content:?}");
+        };
+        assert_eq!(
+            rejection.status, 400,
+            "unrenderable compaction content must return HTTP 400"
+        );
+        let body = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+        assert!(body.contains("compaction"), "unexpected rejection: {body}");
+        assert!(body.contains("cannot be represented"), "unexpected rejection: {body}");
+    }
+}
+
+#[test]
+fn compaction_source_rejects_text_part_semantic_metadata() {
+    for (field, value) in [
+        (
+            "annotations",
+            json!([{"type": "url_citation", "url": "https://example.test"}]),
+        ),
+        ("logprobs", json!([{"token": "hello", "logprob": -0.1}])),
+        ("prompt_cache_breakpoint", json!({"mode": "explicit"})),
+    ] {
+        let mut part = json!({"type": "output_text", "text": "hello"});
+        part[field] = value;
+        let messages = [json!({"type": "message", "role": "assistant", "content": [part]})];
+
+        let Err(FilterAction::Reject(rejection)) = validate_compaction_source(messages.iter()) else {
+            panic!("{field} must be rejected before compaction");
+        };
+        assert_eq!(rejection.status, 400, "{field} rejection must return HTTP 400");
+        let body = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+        assert!(body.contains(field), "unexpected rejection: {body}");
+    }
+}
+
+#[test]
+fn reactive_source_validation_checks_only_replaced_history() {
+    let image = json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_image", "image_url": "https://example.test/image.png"}]
+    });
+    let text = json!({"type": "message", "role": "user", "content": "hello"});
+
+    let mut rejected = ResponsesState::from_request_body(json!({"model": "gpt-4o", "input": "new turn"}));
+    rejected.messages = vec![image.clone(), text.clone()].into();
+    assert!(
+        validate_reactive_compaction_source(&rejected).is_err(),
+        "non-text replaced history must be rejected"
+    );
+
+    let mut accepted = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_image", "image_url": "https://example.test/image.png"}]
+        }]
+    }));
+    accepted.messages = vec![text, image].into();
+    validate_reactive_compaction_source(&accepted)
+        .expect("multimodal current-turn tail is preserved and must remain accepted");
+}
+
+#[tokio::test]
+async fn reactive_compaction_rejects_non_text_history_before_callout() {
+    let filter = make_filter("open");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "new turn",
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}]
+    }));
+    state.messages = vec![
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_image", "image_url": "https://example.test/image.png"}]
+        }),
+        json!({"type": "message", "role": "user", "content": "new turn"}),
+    ]
+    .into();
+    state.previous_usage = Some(json!({"total_tokens": 2000}));
+
+    let Err(FilterAction::Reject(rejection)) = filter.check_and_summarize(&mut state).await else {
+        panic!("non-text history must fail closed before the summarization callout");
+    };
+    assert_eq!(rejection.status, 400, "non-text history must return HTTP 400");
+    let body = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(body.contains("input_image"), "unexpected rejection: {body}");
+}
+
 #[tokio::test]
 async fn reactive_compaction_rejects_source_expansion_before_callout_even_when_fail_open() {
     let filter = make_filter("open");
@@ -1125,6 +1399,69 @@ async fn explicit_compaction_loads_previous_response_only_for_exact_owner() {
     assert_eq!(messages, vec![json!({"role": "user", "content": "private"})]);
 }
 
+#[tokio::test]
+#[cfg(feature = "store-sqlite")]
+async fn collect_compact_messages_model_only_is_empty() {
+    // Issue #1139: `model` is the only required field, so a request with no
+    // inline input and no `previous_response_id` collects an empty conversation
+    // rather than being rejected; the caller persists a no-op compaction.
+    let backend: std::sync::Arc<dyn crate::store::PersistedStateBackend> = std::sync::Arc::new(
+        crate::store::SqliteResponseStore::new("sqlite::memory:", "responses", "conversations", None, None, None)
+            .await
+            .unwrap(),
+    );
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    let registry = ResponseStoreRegistry::new();
+    registry.register(&std::sync::Arc::from("default"), backend).unwrap();
+    let mut request = parse_compact_request_body(&Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#))).unwrap();
+
+    let store = registry.get_scoped("default", &owner).unwrap();
+    let messages = collect_compact_messages(&store, &mut request, &mut None).await.unwrap();
+    assert!(
+        messages.is_empty(),
+        "a model-only request collects an empty conversation"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "store-sqlite")]
+async fn collect_compact_messages_empty_stored_history_is_empty() {
+    // Issue #1139: a `previous_response_id` whose stored history is empty also
+    // collects an empty conversation and is compacted as a no-op rather than
+    // rejected with "no messages to compact".
+    let backend: std::sync::Arc<dyn crate::store::PersistedStateBackend> = std::sync::Arc::new(
+        crate::store::SqliteResponseStore::new("sqlite::memory:", "responses", "conversations", None, None, None)
+            .await
+            .unwrap(),
+    );
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    backend
+        .upsert_response(&ResponseRecord {
+            id: "resp_empty".to_owned(),
+            owner: owner.clone(),
+            created_at: 1_000,
+            model: "gpt-4.1".to_owned(),
+            response_object: json!({"id": "resp_empty", "status": "completed"}),
+            input: json!([]),
+            messages: json!([]),
+        })
+        .await
+        .unwrap();
+    let registry = ResponseStoreRegistry::new();
+    registry.register(&std::sync::Arc::from("default"), backend).unwrap();
+    let mut request = parse_compact_request_body(&Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","previous_response_id":"resp_empty"}"#,
+    )))
+    .unwrap();
+
+    let store = registry.get_scoped("default", &owner).unwrap();
+    let messages = collect_compact_messages(&store, &mut request, &mut None).await.unwrap();
+    assert!(
+        messages.is_empty(),
+        "an empty stored history collects an empty conversation"
+    );
+}
+
 #[test]
 fn parse_compact_request_body_with_string_input() {
     let body = Some(Bytes::from(
@@ -1181,10 +1518,29 @@ fn parse_compact_request_body_empty_model() {
 }
 
 #[test]
-fn parse_compact_request_body_missing_content() {
-    // `model` alone, with neither `input` nor `previous_response_id`.
+fn parse_compact_request_body_model_only_is_accepted() {
+    // Issue #1139: `model` is the only required field, so a body with neither
+    // `input` nor `previous_response_id` is schema-valid and must parse.
     let body = Some(Bytes::from(serde_json::to_vec(&json!({"model": "gpt-4o"})).unwrap()));
-    assert!(parse_compact_request_body(&body).is_err());
+    let req = parse_compact_request_body(&body).unwrap();
+    assert_eq!(req.model, "gpt-4o");
+    assert!(req.input.is_empty());
+    assert!(req.previous_response_id.is_none());
+    assert!(req.instructions.is_none());
+}
+
+#[test]
+fn parse_compact_request_body_empty_input_variants_are_accepted() {
+    // Issue #1139: explicit null, empty-string, and empty-array `input` values
+    // are all schema-valid ways to carry no conversation.
+    for field in [json!(null), json!(""), json!([])] {
+        let body = Some(Bytes::from(
+            serde_json::to_vec(&json!({"model": "gpt-4o", "input": field})).unwrap(),
+        ));
+        let req = parse_compact_request_body(&body).unwrap();
+        assert!(req.input.is_empty(), "{field} must collect an empty conversation");
+        assert!(req.previous_response_id.is_none());
+    }
 }
 
 // =============================================================================
@@ -1251,7 +1607,7 @@ fn parse_compact_input_absent_and_null_are_empty_list() {
 #[test]
 fn parse_compact_input_empty_string_is_empty_list() {
     // An empty-content string is distinct from a wrong type; it is schema-valid
-    // emptiness (tracked by #1139), not a 400.
+    // emptiness that compacts to a no-op (#1139), not a 400.
     assert!(parse_compact_input(Some(json!(""))).unwrap().is_empty());
 }
 
@@ -1327,8 +1683,9 @@ fn parse_compact_input_text_part_with_null_or_absent_text_is_rejected() {
 
 #[test]
 fn parse_compact_input_multimodal_part_without_text_is_accepted() {
-    // An image/file part legitimately carries no `text`; the formatter ignores
-    // it, so validation must not reject it as malformed.
+    // An image/file part legitimately carries no `text`, so syntax validation
+    // accepts it. Source validation rejects it later if compaction would replace
+    // the item and thereby discard its non-text content.
     let items = parse_compact_input(Some(json!([{
         "role": "user",
         "content": [
@@ -1580,8 +1937,8 @@ fn parse_compact_input_message_without_content_is_rejected() {
 
 #[test]
 fn parse_compact_input_message_with_empty_content_is_accepted() {
-    // Schema-valid emptiness (#1139) must not be rejected: an empty string and
-    // an empty content list are both well-formed.
+    // Schema-valid emptiness (#1139) is accepted, not rejected: an empty string
+    // and an empty content list are both well-formed.
     assert_eq!(
         parse_compact_input(Some(json!([{"role": "user", "content": ""}])))
             .unwrap()
@@ -1796,6 +2153,20 @@ fn is_compactable_returns_false_with_non_compaction_config() {
 // =============================================================================
 // Test Utilities
 // =============================================================================
+
+#[track_caller]
+fn assert_compaction_source_rejects_reasoning_item(item: Value) {
+    let messages = [item];
+    let Err(FilterAction::Reject(rejection)) = validate_compaction_source(messages.iter()) else {
+        panic!("unrepresentable reasoning item must be rejected");
+    };
+    assert_eq!(rejection.status, 400, "unrepresentable reasoning must return HTTP 400");
+    let body = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(
+        body.contains("compaction cannot replace source item"),
+        "unexpected rejection: {body}"
+    );
+}
 
 /// Assert a parse result is an HTTP 400 `invalid_request_error` whose message
 /// contains `needle`. Generic over the success type so it covers both whole-body
