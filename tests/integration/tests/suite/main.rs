@@ -85,7 +85,11 @@ mod openai_responses_request;
 #[cfg(feature = "openai-responses")]
 mod openai_tool_parse;
 mod opencode;
+mod opencode_v2;
+mod opencode_v2_vllm;
 mod opencode_vllm;
+mod pi;
+mod pi_vllm;
 mod prompt_enrich;
 #[cfg(feature = "openai-responses")]
 mod responses_routing;

@@ -118,7 +118,7 @@ def _find_tenant_binary() -> str:
     )
 
 
-def _conversations_filter(table_prefix: str, db_path: str) -> dict:
+def _conversations_filter(table_prefix: str, db_path: str, ttl: str | None = None, sweep_interval: str | None = None) -> dict:
     """Build the conversations store for the backend configured by CI."""
     tables = {
         "conversations_table": f"{table_prefix}_conversations",
@@ -146,11 +146,16 @@ def _conversations_filter(table_prefix: str, db_path: str) -> dict:
             "database_url": f"sqlite://{db_path}?mode=rwc",
             "pool": {"max_connections": 1},
         }
-    return {
+    result = {
         "filter": "openai_conversations",
         **store,
         **tables,
     }
+    if ttl is not None:
+        result["ttl"] = ttl
+    if sweep_interval is not None:
+        result["sweep_interval"] = sweep_interval
+    return result
 
 
 def _write_config(
@@ -2718,6 +2723,262 @@ def test_nullable_function_output_fields(conversation_backend, fields):
             )
 
 
+def test_orphan_function_call_output_survives_repeated_chat_turns(conversation_backend):
+    """Orphan function_call_output items must not wedge either lane.
+
+    A stored function_call_output whose call_id is missing or explicitly null
+    has no tool call to attach to. The translated lane must lower it to user
+    text instead of failing the request, keep linked outputs as tool messages
+    with their real IDs, and retain the stored item itself across repeated
+    turns. The native lane verifies passthrough only: the loopback backend
+    accepts anything, so it is not evidence that a real provider accepts
+    orphan outputs.
+    """
+    client, captured, _, translated = conversation_backend
+    conversation = client.conversations.create(
+        items=[
+            {
+                "type": "function_call_output",
+                "call_id": None,
+                "output": "orphan null result",
+            },
+            {
+                "type": "function_call_output",
+                "output": "orphan missing result",
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_linked",
+                "name": "lookup",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_linked",
+                "output": "linked result",
+            },
+        ]
+    )
+    first = client.responses.create(
+        model="test-model", conversation=conversation.id, input="first turn"
+    )
+    second = client.responses.create(
+        model="test-model", conversation=conversation.id, input="second turn"
+    )
+    assert first.status == "completed", "orphan outputs must not fail the first turn"
+    assert second.status == "completed", "replayed orphan outputs must not fail a later turn"
+    assert len(captured) == 2, "each turn must reach the backend exactly once"
+    for (path, body), turn_input in zip(captured, ["first turn", "second turn"]):
+        if translated:
+            assert path == "/v1/chat/completions", "translated lane must forward Chat Completions"
+            messages = body["messages"]
+            tool_messages = [m for m in messages if m.get("role") == "tool"]
+            assert all(
+                m.get("tool_call_id") == "call_linked" for m in tool_messages
+            ), "orphan outputs must never be forwarded as tool messages"
+            user_texts = [
+                m["content"]
+                for m in messages
+                if m.get("role") == "user" and isinstance(m.get("content"), str)
+            ]
+            assert "orphan null result" in user_texts, (
+                "an explicitly null call_id must lower to user text"
+            )
+            assert "orphan missing result" in user_texts, (
+                "a missing call_id must lower to user text"
+            )
+            assert turn_input in user_texts, "the turn input must still be forwarded"
+            assert any(
+                m.get("role") == "assistant"
+                and any(
+                    tc.get("id") == "call_linked" for tc in m.get("tool_calls", [])
+                )
+                for m in messages
+            ), "the linked function call must stay an assistant tool_call"
+            assert any(
+                m.get("tool_call_id") == "call_linked" and m.get("content") == "linked result"
+                for m in tool_messages
+            ), "the linked output must stay a tool message with its real ID"
+        else:
+            assert path == "/v1/responses", "native lane must forward Responses"
+            input_items = body["input"]
+            orphan_passthrough = [
+                i
+                for i in input_items
+                if i.get("type") == "function_call_output" and i.get("call_id") is None
+            ]
+            assert len(orphan_passthrough) == 2, (
+                "native passthrough must retain stored orphan items as-is"
+            )
+    listed = client.conversations.items.list(conversation.id, order="asc").data
+    orphan_items = [
+        i
+        for i in listed
+        if i.type == "function_call_output" and "call_id" not in i.model_fields_set
+    ]
+    assert {item.output for item in orphan_items} == {
+        "orphan null result",
+        "orphan missing result",
+    }, "stored orphan items must survive two responses in their normalized stored shape"
+
+
+def test_orphan_output_between_call_and_linked_output_stays_after_tool_result(conversation_backend):
+    """An orphan output between a call and its linked output must not break adjacency.
+
+    Chat Completions backends reject a request where a message sits between
+    an assistant tool_calls message and the tool messages answering its call
+    IDs. Stored history can legally interleave an orphan function_call_output
+    between the function_call and its linked output, so the translated lane
+    must keep the tool answer adjacent to its call and lower the orphan
+    after it. The native lane forwards the stored order untouched.
+    """
+    client, captured, _, translated = conversation_backend
+    conversation = client.conversations.create(
+        items=[
+            {
+                "type": "function_call",
+                "call_id": "call_interleave",
+                "name": "lookup",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "output": "orphan interlude result",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_interleave",
+                "output": "linked result",
+            },
+        ]
+    )
+    response = client.responses.create(
+        model="test-model", conversation=conversation.id, input="next turn"
+    )
+    assert response.status == "completed", "the interleaved orphan must not fail the turn"
+    assert len(captured) == 1, "the turn must reach the backend exactly once"
+    path, body = captured[0]
+    if translated:
+        assert path == "/v1/chat/completions", "translated lane must forward Chat Completions"
+        sequence = [
+            (m["role"], m.get("tool_call_id"), m.get("content"))
+            for m in body["messages"]
+        ]
+        assert sequence == [
+            ("assistant", None, None),
+            ("tool", "call_interleave", "linked result"),
+            ("user", None, "orphan interlude result"),
+            ("user", None, "next turn"),
+        ], "the tool answer must stay adjacent to its call, with the orphan lowered after it"
+    else:
+        assert path == "/v1/responses", "native lane must forward Responses"
+        input_items = body["input"]
+        assert [i["type"] for i in input_items if isinstance(i, dict)] == [
+            "function_call",
+            "function_call_output",
+            "function_call_output",
+            "message",
+        ], "native passthrough must keep the stored item order, then the turn input"
+        assert input_items[1].get("call_id") is None, "the orphan item must pass through without a call_id"
+        assert input_items[2]["call_id"] == "call_interleave", "the linked output must keep its call_id"
+        turn_item = input_items[3]
+        assert turn_item.get("role") == "user", "the turn input must stay a user message"
+        content = turn_item["content"]
+        if isinstance(content, list):
+            turn_text = "".join(
+                part["text"]
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "input_text"
+            )
+        else:
+            turn_text = content
+        assert turn_text == "next turn", "the turn input must still be forwarded"
+
+
+def test_linked_output_after_a_later_call_block_stays_with_its_call(conversation_backend):
+    """An answer trailing a later call block must still follow its own call.
+
+    Stored history can interleave call blocks and answers across items: a
+    function_call, an orphan output, a second function_call, then the linked
+    outputs for both calls in stored order. The translated lane must keep
+    each tool answer adjacent to the assistant message that asked for it,
+    even when the answer trails a later call block; the native lane forwards
+    the stored order untouched.
+    """
+    client, captured, _, translated = conversation_backend
+    conversation = client.conversations.create(
+        items=[
+            {
+                "type": "function_call",
+                "call_id": "call_first",
+                "name": "lookup",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "output": "orphan interlude result",
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_second",
+                "name": "search",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_first",
+                "output": "first result",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_second",
+                "output": "second result",
+            },
+        ]
+    )
+    response = client.responses.create(
+        model="test-model", conversation=conversation.id, input="next turn"
+    )
+    assert response.status == "completed", "the trailing answer must not fail the turn"
+    assert len(captured) == 1, "the turn must reach the backend exactly once"
+    path, body = captured[0]
+    if translated:
+        assert path == "/v1/chat/completions", "translated lane must forward Chat Completions"
+        sequence = [
+            (m["role"], m.get("tool_call_id"), m.get("content"))
+            for m in body["messages"]
+        ]
+        assert sequence == [
+            ("assistant", None, None),
+            ("tool", "call_first", "first result"),
+            ("user", None, "orphan interlude result"),
+            ("assistant", None, None),
+            ("tool", "call_second", "second result"),
+            ("user", None, "next turn"),
+        ], "each tool answer must directly follow the assistant message that asked for it"
+        call_ids = [
+            call["id"]
+            for m in body["messages"]
+            if m["role"] == "assistant"
+            for call in m.get("tool_calls", [])
+        ]
+        assert call_ids == ["call_first", "call_second"], "the call blocks must keep their order"
+    else:
+        assert path == "/v1/responses", "native lane must forward Responses"
+        input_items = body["input"]
+        assert [i["type"] for i in input_items if isinstance(i, dict)] == [
+            "function_call",
+            "function_call_output",
+            "function_call",
+            "function_call_output",
+            "function_call_output",
+            "message",
+        ], "native passthrough must keep the stored item order, then the turn input"
+        assert input_items[1].get("call_id") is None, "the orphan item must pass through without a call_id"
+        assert input_items[3]["call_id"] == "call_first", "the first linked output must keep its call_id"
+        assert input_items[4]["call_id"] == "call_second", "the second linked output must keep its call_id"
+
+
 def test_structured_mcp_failure_append_back(conversation_backend):
     """Failed native MCP items round-trip into stored conversation history."""
     client, _, output, translated = conversation_backend
@@ -2832,6 +3093,101 @@ def test_capturing_backend_records_both_request_framings(chunked):
         backend.shutdown()
         backend.server_close()
         thread.join(timeout=5)
+
+
+@pytest.fixture
+def ttl_proxy_client():
+    """Start a proxy with short TTL for testing automatic purge (function-scoped to isolate)."""
+    with tempfile.TemporaryDirectory() as db_dir:
+        port = _free_port()
+        readiness_port = _free_port()
+        db_path = os.path.join(db_dir, "ttl_test.db")
+
+        # Build config with short TTL: 2s retention, 1s sweep interval
+        conversations_filter = _conversations_filter(
+            f"ttl_{port}", db_path, ttl="2s", sweep_interval="1s"
+        )
+        config = {
+            "listeners": [
+                {
+                    "name": "ttl-test",
+                    "address": f"127.0.0.1:{port}",
+                    "filter_chains": ["ttl-pipeline"],
+                }
+            ],
+            "filter_chains": [
+                {
+                    "name": "ttl-pipeline",
+                    "filters": [
+                        {
+                            "filter": "state_owner",
+                            "mode": "trusted_owner",
+                            "header": OWNER_HEADER,
+                        },
+                        {"filter": "ai_operation"},
+                        conversations_filter,
+                    ],
+                }
+            ],
+        }
+        fd, config_path = tempfile.mkstemp(suffix=".yaml")
+        with os.fdopen(fd, "w") as f:
+            json.dump(config, f)
+
+        binary = _find_binary()
+        proc = subprocess.Popen(
+            [binary, "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_proxy_env(readiness_port),
+        )
+        try:
+            _wait_for_proxy(port, proc)
+            _wait_for_store_ready(readiness_port, proc)
+            yield OpenAI(
+                api_key="not-needed",
+                base_url=f"http://127.0.0.1:{port}/v1",
+                default_headers={OWNER_HEADER: _owner_assertion("ttl_test")},
+                max_retries=0,
+                timeout=10.0,
+            )
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            if proc.stderr:
+                proc.stderr.close()
+            os.unlink(config_path)
+
+
+def test_ttl_purges_conversation_after_expiration(ttl_proxy_client):
+    """TTL reaper purges conversations older than configured retention period.
+
+    The reaper runs in the real binary (launched via subprocess), sweeping
+    records whose created_at exceeds the configured ttl. Activity does NOT
+    extend retention; ttl is measured from creation time only.
+    """
+    conversation = ttl_proxy_client.conversations.create(
+        metadata={"test": "ttl_purge"}
+    )
+    assert conversation.id.startswith("conv_"), "conversation must be created"
+
+    # Verify the conversation exists immediately after creation
+    retrieved = ttl_proxy_client.conversations.retrieve(conversation.id)
+    assert retrieved.id == conversation.id, "conversation must be retrievable immediately"
+
+    # Wait for ttl (2s) + sweep_interval (1s) + margin (3s) = 6s total
+    # This ensures at least one full sweep cycle completes after expiration
+    time.sleep(6)
+
+    # Conversation should now be purged
+    with pytest.raises(NotFoundError) as exc_info:
+        ttl_proxy_client.conversations.retrieve(conversation.id)
+    assert exc_info.value.status_code == 404, "expired conversation must be purged and return 404"
 
 
 if __name__ == "__main__":

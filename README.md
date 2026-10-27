@@ -34,7 +34,7 @@ backends and applies policy.
   [Bedrock](examples/configs/bedrock/chat-completions-to-converse.yaml), and
   [Vertex](examples/configs/vertex/chat-completions-to-gemini.yaml) examples.
 - **Code harness support.** Run Codex through OpenAI Responses, Claude Code
-  through Anthropic Messages, and OpenCode through Chat Completions. The
+  through Anthropic Messages, and OpenCode and pi through Chat Completions. The
   [coding client guide](docs/developing/cli-vllm-through-praxis.md) shows each
   client reaching native vLLM endpoints or Chat Completions through translation.
 - **Manage OpenAI response state.** Persist and rehydrate Responses history,
@@ -134,7 +134,10 @@ docker pull ghcr.io/praxis-proxy/ai:latest
 ```
 
 Podman can pull the same OCI image. See the [quickstart] for a source build
-and the [release documentation] for image contents and tagging. A FIPS 140-3
+and the [release documentation] for image contents and tagging. An image
+with the experimental OpenAI Responses filters and SQLite and PostgreSQL
+stores is published with an `-experimental` suffix (for example
+`nightly-experimental`). A FIPS 140-3
 build for Red Hat Enterprise Linux hosts is published under the same tags
 with a `-fips` suffix (for example `latest-fips`); see
 [FIPS 140-3](docs/fips.md).
@@ -161,9 +164,18 @@ For larger changes, open a [feature request] and follow the
 [release documentation]: docs/release.md
 [security policy]: .github/SECURITY.md
 
+## Community
+
+Read [GOVERNANCE.md](GOVERNANCE.md) to see how our community works.
+
+Feel free to join our [discussion forums] to ask questions or share ideas.
+
+Or please join us in our Slack channel on [CNCF Slack]: [#praxis] channel
+
+[discussion forums]:https://github.com/praxis-proxy/praxis/discussions
+
 ## License
 
 Apache 2.0
-
 
 [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fai.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fpraxis-proxy%2Fai?ref=badge_large)

@@ -51,6 +51,10 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  # Line-tables-only debuginfo: faster codegen and much smaller target/ caches
+  # (debuginfo dominates artifact size), which also eases the hard 10 GB cache
+  # cap so caches survive longer. Backtraces still resolve.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   V: ${{ inputs.debug && '1' || '' }}
 
 jobs:
@@ -149,7 +153,39 @@ jobs:
           cache-suffix: test-inference-cargo
 
       - name: Inference fixture tests
-        run: make test-inference-fixtures
+        run: make test-inference-fixtures-core
+
+  # ----------------------------------------------------------------------------
+  # xtask inference-fixture compile
+  #
+  # Split out of test-inference: the xtask crate graph shares no target
+  # artifacts with the test-utils/suite builds, so compiling it in the same job
+  # serialized two independent heavy builds. Cache-neutral (registry-only); the
+  # cold compile stays below the test-integration pole.
+  # ----------------------------------------------------------------------------
+
+  test-inference-xtask:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
+
+      - name: xtask inference fixture tests
+        run: make test-inference-xtask
 
   test-integration:
     needs: [changes]
@@ -157,9 +193,10 @@ jobs:
       always() &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
-    # store-all base compile plus the suite's two feature permutations
-    # (store-all and store-all + experimental filters); 45m leaves headroom for
-    # cache-cold runs while warmed caches finish well inside it.
+    # store-all base compile plus the full integration suite. The experimental
+    # permutation and the Bedrock SDK test now run as sibling jobs, off this
+    # job's critical path. 45m leaves headroom for cache-cold runs while warmed
+    # caches finish well inside it.
     timeout-minutes: 45
     permissions:
       contents: read
@@ -183,15 +220,80 @@ jobs:
       - name: Integration tests
         env:
           PRAXIS_TEST_CLAUDE_CODE_BIN: claude
-        run: make test-integration
+        run: make test-integration-core
+
+  # ----------------------------------------------------------------------------
+  # Experimental-filter permutation (store-all + example-config filters)
+  #
+  # Split out of test-integration so this second feature graph compiles in
+  # parallel instead of extending that job's critical path. Cache-neutral: a
+  # registry-only cache (cache-target: false) under a shared suffix, adding no
+  # new target/ cache family against the hard 10 GB cap. The cold compile is
+  # fine because this job sits below the test-integration pole.
+  # ----------------------------------------------------------------------------
+
+  test-integration-experimental:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
+
+      - name: Experimental-filter integration tests
+        run: make test-integration-experimental
+
+  # ----------------------------------------------------------------------------
+  # Bedrock Converse OpenAI SDK test (default-features proxy)
+  #
+  # Split out of test-integration: it needs only a default-features proxy build
+  # — a different feature graph than store-all — so riding along forced a full
+  # recompile on that job's critical path. Mirrors the azure-sdk / anthropic-sdk
+  # jobs. Cache-neutral (registry-only).
+  # ----------------------------------------------------------------------------
+
+  bedrock-sdk:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
 
       - name: Install uv
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: tests/integration/sdk/openai/test_bedrock_converse_chat_completions.py
 
-      - name: Build Praxis for SDK tests
+      - name: Build Praxis
         run: cargo build -p praxis-ai-proxy
 
-      - name: Bedrock Converse OpenAI SDK tests
+      - name: Run Bedrock Converse OpenAI SDK tests
         run: uv run tests/integration/sdk/openai/test_bedrock_converse_chat_completions.py -s
 
   # ----------------------------------------------------------------------------
@@ -226,31 +328,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Scope environment suite to ext-proc changes on pull_request
+      - name: Scope environment tests to relevant changes
         id: scope
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          if [ "$EVENT_NAME" != "pull_request" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          CHANGED=$(git diff --name-only "$PR_BASE_SHA" HEAD -- \
-            'integrations/' \
-            'tests/environment/' \
-            'tests/utils/' \
-            'tests/integration/tests/suite/examples/llmd_ext_proc.rs' \
-            'Cargo.toml' \
-            'Cargo.lock' \
-            'Makefile' \
-            '.github/workflows/integration.yaml')
-          if [ -n "$CHANGED" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "No ext-proc-relevant changes; skipping environment suite." >> "$GITHUB_STEP_SUMMARY"
-          fi
+        run: bash .github/scripts/scope-environment-tests.sh environment
 
       - name: Setup Rust
         if: steps.scope.outputs.run == 'true'
@@ -260,6 +343,49 @@ jobs:
       - name: Environment tests
         if: steps.scope.outputs.run == 'true'
         run: make test-environment
+
+  # ----------------------------------------------------------------------------
+  # llmd-ext-proc integration suite
+  #
+  # Split out of the environment job: the praxis-tests-integration ext-proc
+  # suite is the heaviest compile in that group, so running it in the same job
+  # serialized it behind the ext-proc and environment crates. It shares the
+  # pull_request scope helper and adds its own test source (push and merge_group
+  # always run it).
+  # Cache-neutral (registry-only).
+  # ----------------------------------------------------------------------------
+
+  environment-suite:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scope environment suite to relevant changes
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash .github/scripts/scope-environment-tests.sh suite
+
+      - name: Setup Rust
+        if: steps.scope.outputs.run == 'true'
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
+      - name: Environment ext-proc suite
+        if: steps.scope.outputs.run == 'true'
+        run: make test-environment-suite
 
   # ----------------------------------------------------------------------------
   # OpenAI Python SDK vs Azure translation (local fake backend)
@@ -297,16 +423,15 @@ jobs:
         run: uv run tests/integration/sdk/openai/test_azure_chat_completions.py -s
 
   # ----------------------------------------------------------------------------
-  # OpenAI Agents SDK function-tool loop over Responses (local scripted backend)
+  # Responses/agentic feature-boundary checks
   #
-  # One required job, not a per-storage/per-SDK-lane matrix: the Agents SDK owns
-  # its own compatible `openai` dependency (pinned via PEP 723 in the test), and
-  # storage backend is not what this test measures. It proves the SDK-managed
-  # model -> tool -> model loop crosses Praxis's /v1/responses deterministically
-  # with no credentials, network, or inference probability.
+  # Split out of agents-sdk: `make test-responses-features` is a multi-group
+  # feature-boundary compile (~18m) that dominated that job once the other poles
+  # fell. Keeps the agents-sdk-cargo cache (it is the heavy half); the Agents SDK
+  # build + test runs as the sibling below.
   # ----------------------------------------------------------------------------
 
-  agents-sdk:
+  responses-features:
     needs: [changes]
     if: |
       always() &&
@@ -329,10 +454,48 @@ jobs:
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
-          cache-dependency-glob: tests/integration/sdk/openai/test_openai_agents_sdk.py
+          cache-dependency-glob: tests/integration/sdk/openai/test_openai_conversations.py
 
       - name: Check Responses and agentic feature boundaries
         run: make test-responses-features
+
+  # ----------------------------------------------------------------------------
+  # OpenAI Agents SDK function-tool loop over Responses (local scripted backend)
+  #
+  # One required job, not a per-storage/per-SDK-lane matrix: the Agents SDK owns
+  # its own compatible `openai` dependency (pinned via PEP 723 in the test), and
+  # storage backend is not what this test measures. It proves the SDK-managed
+  # model -> tool -> model loop crosses Praxis's /v1/responses deterministically
+  # with no credentials, network, or inference probability. The feature-boundary
+  # checks moved to responses-features above; this job builds the experimental
+  # proxy and runs the SDK loop. Cache-neutral (registry-only).
+  # ----------------------------------------------------------------------------
+
+  agents-sdk:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: ci-split-registry
+          cache-target: "false"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: tests/integration/sdk/openai/test_openai_agents_sdk.py
 
       - name: Build Praxis with experimental Responses
         run: cargo build -p praxis-ai-proxy --features openai-all,store-sqlite
@@ -534,7 +697,7 @@ jobs:
     permissions:
       contents: read
     env:
-      OPENCODE_VERSION: "1.18.35"
+      OPENCODE_VERSION: "1.19.3"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -607,6 +770,260 @@ jobs:
             "$runner_cargo_home" \
             "$runner_path" \
             "$PRAXIS_TEST_OPENCODE_BIN"
+
+  # ----------------------------------------------------------------------------
+  # Pinned OpenCode 2.x CLI acceptance
+  #
+  # The 2.x client is a breaking release proven beside the 1.x lane above, not
+  # instead of it. Same network-namespace isolation, same scripted backend,
+  # four lanes: plugin, provider headers, plugin absent, and guard tripped.
+  #
+  # 2.x ships as `@opencode/cli`, not `opencode-ai`. Rather than
+  # `npm install -g` — whose `opencode`/`opencode2` bins collide with a global
+  # 1.x install — this fetches the self-contained platform tarball and verifies
+  # it against the committed checksum, exactly as the GPU lane does, so both
+  # lanes stage a byte-identical client.
+  #
+  # Pins live in tests/integration/fixtures/opencode-cli-v2/pin.toml. To bump
+  # the version, update that manifest, its checksum fixture,
+  # OPENCODE_V2_PINNED_VERSION in tests/integration/tests/suite/harness.rs, and
+  # OPENCODE_V2_VERSION below together; `pin_toml_version_matches_harness_const`,
+  # `checksum_fixture_names_the_pinned_platform_tarball`, and
+  # `opencode_v2_lane_is_wired_in_ci` fail if any of them drifts.
+  # ----------------------------------------------------------------------------
+
+  opencode-v2-cpu:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      OPENCODE_V2_VERSION: "2.1.2"
+      OPENCODE_V2_PLATFORM: "linux-x64"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: opencode-v2-cpu-cargo
+
+      - name: Install pinned OpenCode 2.x CLI
+        run: |
+          set -euo pipefail
+          tarball="cli-$OPENCODE_V2_PLATFORM-$OPENCODE_V2_VERSION.tgz"
+          work="$RUNNER_TEMP/opencode-v2-$OPENCODE_V2_VERSION"
+          mkdir -p "$work"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            --output "$work/$tarball" \
+            "https://registry.npmjs.org/@opencode/cli-$OPENCODE_V2_PLATFORM/-/$tarball"
+          (
+            cd "$work"
+            sha256sum --check \
+              "$GITHUB_WORKSPACE/tests/integration/fixtures/opencode-cli-v2/$OPENCODE_V2_VERSION-$OPENCODE_V2_PLATFORM.sha256"
+          )
+          tar --extract --gzip --file "$work/$tarball" --directory "$work"
+          native="$work/package/bin/opencode"
+          if [ ! -x "$native" ]; then
+            echo "::error::expected the native OpenCode 2.x binary at $native; tarball layout changed"
+            tar tzf "$work/$tarball" | head -n 20 || true
+            exit 1
+          fi
+          # Staged beside the Rust artifacts under a distinct name, matching the
+          # GPU lane, so it never shadows a 1.x `opencode` and never executes
+          # from the Actions _temp mount inside the namespace.
+          opencode_bin="$GITHUB_WORKSPACE/target/acceptance-bin/opencode2"
+          mkdir -p "$(dirname "$opencode_bin")"
+          install -m 0755 "$native" "$opencode_bin"
+          # 2.x prints `opencode v<version>`, unlike the bare 1.x version.
+          test "$("$opencode_bin" --version)" = "opencode v${OPENCODE_V2_VERSION}"
+          echo "PRAXIS_TEST_OPENCODE_V2_BIN=$opencode_bin" >> "$GITHUB_ENV"
+
+      - name: Build test binary
+        # Compiled outside the namespace, where the network still exists.
+        run: cargo test -p praxis-tests-integration --features openai-all,store-all --test suite --no-run
+
+      - name: OpenCode 2.x acceptance (network namespace)
+        run: |
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          runner_home="$HOME"
+          runner_cargo_home="$CARGO_HOME"
+          runner_path="$PATH"
+
+          sudo unshare --net -- bash -ceu '
+            runner_uid="$1"
+            runner_gid="$2"
+            runner_home="$3"
+            runner_cargo_home="$4"
+            runner_path="$5"
+            opencode_bin="$6"
+
+            ip link set lo up
+            if ip route show default | grep -q .; then
+              echo "unexpected default route in OpenCode 2.x test namespace" >&2
+              exit 1
+            fi
+            if ip route get 1.1.1.1 >/dev/null 2>&1; then
+              echo "external route available in OpenCode 2.x test namespace" >&2
+              exit 1
+            fi
+
+            setpriv \
+              --reuid="$runner_uid" \
+              --regid="$runner_gid" \
+              --clear-groups \
+              -- env \
+                HOME="$runner_home" \
+                CARGO_HOME="$runner_cargo_home" \
+                CARGO_INCREMENTAL=0 \
+                PATH="$runner_path" \
+                PRAXIS_TEST_OPENCODE_V2_BIN="$opencode_bin" \
+                bash -ceu "
+                  cargo test --offline -p praxis-tests-integration --features openai-all,store-all --test suite \
+                    opencode_v2:: -- --nocapture
+                "
+          ' bash \
+            "$runner_uid" \
+            "$runner_gid" \
+            "$runner_home" \
+            "$runner_cargo_home" \
+            "$runner_path" \
+            "$PRAXIS_TEST_OPENCODE_V2_BIN"
+
+  # ----------------------------------------------------------------------------
+  # Pinned pi coding agent acceptance
+  #
+  # Same shape as the OpenCode lanes: the pinned client drives the documented
+  # `models.json` through the shipped native-vLLM example to a scripted backend,
+  # inside a network namespace with no route out. pi needs no egress beyond
+  # Praxis — verified against the pinned build — and the namespace keeps that a
+  # standing guarantee rather than a one-time observation.
+  #
+  # The upstream release archive is verified against the committed checksum,
+  # exactly as the GPU lane does, so both lanes stage a byte-identical client.
+  # The whole extracted directory is staged: the binary reads its version and
+  # assets from beside itself.
+  #
+  # Pins live in tests/integration/fixtures/pi-cli/pin.toml. To bump the
+  # version, update that manifest, its checksum fixture, PI_PINNED_VERSION in
+  # tests/integration/tests/suite/harness.rs, and PI_VERSION below together;
+  # `pin_toml_version_matches_harness_const`,
+  # `checksum_fixture_names_the_pinned_release_archive`, and
+  # `pi_lane_is_wired_in_ci` fail if any of them drifts.
+  # ----------------------------------------------------------------------------
+
+  pi-cpu:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      PI_VERSION: "1.4.0"
+      PI_PLATFORM: "linux-x64"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
+        with:
+          cache-suffix: pi-cpu-cargo
+
+      - name: Install pinned pi CLI
+        run: |
+          set -euo pipefail
+          archive="pi-$PI_PLATFORM.tar.gz"
+          work="$RUNNER_TEMP/pi-$PI_VERSION"
+          mkdir -p "$work"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+            --output "$work/$archive" \
+            "https://github.com/earendil-works/pi/releases/download/v$PI_VERSION/$archive"
+          (
+            cd "$work"
+            sha256sum --check \
+              "$GITHUB_WORKSPACE/tests/integration/fixtures/pi-cli/$PI_VERSION-$PI_PLATFORM.sha256"
+          )
+          # Staged beside the Rust artifacts, matching the GPU lane, so it never
+          # executes from the Actions _temp mount inside the namespace.
+          stage="$GITHUB_WORKSPACE/target/acceptance-bin"
+          rm -rf "$stage/pi"
+          mkdir -p "$stage"
+          tar --extract --gzip --file "$work/$archive" --directory "$stage"
+          pi_bin="$stage/pi/pi"
+          if [ ! -x "$pi_bin" ]; then
+            echo "::error::expected the pi binary at $pi_bin; archive layout changed"
+            tar tzf "$work/$archive" | head -n 20 || true
+            exit 1
+          fi
+          # The client prints the bare version with no product prefix.
+          test "$("$pi_bin" --version < /dev/null)" = "${PI_VERSION}"
+          echo "PRAXIS_TEST_PI_BIN=$pi_bin" >> "$GITHUB_ENV"
+
+      - name: Build test binary
+        # Compiled outside the namespace, where the network still exists.
+        run: cargo test -p praxis-tests-integration --features openai-all,store-all --test suite --no-run
+
+      - name: pi acceptance (network namespace)
+        run: |
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          runner_home="$HOME"
+          runner_cargo_home="$CARGO_HOME"
+          runner_path="$PATH"
+
+          sudo unshare --net -- bash -ceu '
+            runner_uid="$1"
+            runner_gid="$2"
+            runner_home="$3"
+            runner_cargo_home="$4"
+            runner_path="$5"
+            pi_bin="$6"
+
+            ip link set lo up
+            if ip route show default | grep -q .; then
+              echo "unexpected default route in pi test namespace" >&2
+              exit 1
+            fi
+            if ip route get 1.1.1.1 >/dev/null 2>&1; then
+              echo "external route available in pi test namespace" >&2
+              exit 1
+            fi
+
+            # `pi::` also matches `examples::vllm_agentic_api::`, so skip the
+            # examples tree; it runs in test-integration.
+            setpriv \
+              --reuid="$runner_uid" \
+              --regid="$runner_gid" \
+              --clear-groups \
+              -- env \
+                HOME="$runner_home" \
+                CARGO_HOME="$runner_cargo_home" \
+                CARGO_INCREMENTAL=0 \
+                PATH="$runner_path" \
+                PRAXIS_TEST_PI_BIN="$pi_bin" \
+                bash -ceu "
+                  cargo test --offline -p praxis-tests-integration --features openai-all,store-all --test suite \
+                    pi:: -- --skip examples:: --nocapture
+                "
+          ' bash \
+            "$runner_uid" \
+            "$runner_gid" \
+            "$runner_home" \
+            "$runner_cargo_home" \
+            "$runner_path" \
+            "$PRAXIS_TEST_PI_BIN"
 
   # ----------------------------------------------------------------------------
   # OpenAI Python SDK vs Vertex/Gemini translation (local fake backend)
