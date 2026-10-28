@@ -259,7 +259,7 @@ jobs:
           cache-suffix: vllm-cpu-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every
@@ -461,7 +461,7 @@ jobs:
           cache-suffix: vllm-cpu-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -617,9 +617,9 @@ jobs:
               raise SystemExit(
                   f"compaction window {compaction_context} must be in (0, {context})"
               )
-          # Pinned Claude Code 2.1.267 reserves 2,048 output + 13,000 compaction
-          # tokens, so its effective auto-compaction threshold is
-          # `compaction_context - 15048`. A single ballast read must fit well
+          # Claude Code reserves 2,048 output + 13,000 compaction tokens
+          # (measured on 2.1.267; re-validate on a bump), so its effective
+          # auto-compaction threshold is `compaction_context - 15048`. A single ballast read must fit well
           # under that headroom, or one post-compaction read immediately
           # re-crosses the threshold and the client's rapid-refill breaker aborts
           # the run. Total ballast must still exceed the threshold so compaction
@@ -967,7 +967,7 @@ jobs:
 
       - name: Install uv for Anthropic SDK acceptance
         id: anthropic_sdk_uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.12"
           enable-cache: true
@@ -1596,7 +1596,7 @@ jobs:
     env:
       CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
       CODEX_BIN: codex-x86_64-unknown-linux-musl
-      CODEX_VERSION: 0.144.1
+      CODEX_VERSION: "0.144.1"
       CODEX_VLLM_MODEL: qwen3-8b
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2967,7 +2967,7 @@ jobs:
 
       - name: Log in to GHCR (docker)
         if: env.CONTAINER_RUNTIME == 'docker'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -3035,7 +3035,7 @@ jobs:
           done
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           # The GPU AMI ships Python 3.9; ogx[starter] needs >=3.12, so pin the
           # interpreter setup-uv provisions. Cache is repo-scoped (GH cache
@@ -3412,7 +3412,7 @@ jobs:
         uses: praxis-proxy/conventions/.github/actions/setup-rust@c5837c3fdd35066b05d337594fabe9d641d08df2 # v0.3.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every
